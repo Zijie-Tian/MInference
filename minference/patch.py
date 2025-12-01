@@ -512,7 +512,15 @@ def forward_llama_decoder_layer(
     chunk_size: int = 96_000,
     **kwargs,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-    residual = hidden_states.clone()
+    if type(hidden_states) is tuple:
+        hidden_states = hidden_states[0]
+        
+    try:
+        residual = hidden_states.clone()
+    except:
+        __import__('pdb').set_trace()
+        residual = hidden_states
+    
     batch, seq_len, embed_dim = hidden_states.shape
     if chunk_size == -1:
         chunk_size = seq_len
@@ -548,14 +556,7 @@ def forward_llama_decoder_layer(
         part_hidden_states = self.mlp(part_hidden_states)
         hidden_states[:, start_idx:end_idx, :] += part_hidden_states
 
-    outputs = (hidden_states,)
-    if output_attentions:
-        outputs += (self_attn_weights,)
-
-    if use_cache and len(attention_outputs) == 3:
-        outputs += (attention_outputs[-1],)
-
-    return outputs
+    return hidden_states
 
 
 def forward_llama_model(
@@ -1290,21 +1291,25 @@ def minference_patch_vllm_executor(config_file: str, patch_config={}):
     return update_module
 
 
+def _apply_minference_patch_to_worker(worker, config_file, patch_config):
+    """Worker-side function to apply minference patch to the model."""
+    from minference.patch import minference_patch_vllm_executor
+    model = worker.get_model()
+    patch_executor = minference_patch_vllm_executor(config_file, patch_config)
+    model.apply(patch_executor)
+
+
 def minference_patch_vllm(
     llm,
     config_file,
     patch_config: dict = {},
 ):
-    if "workers" in llm.llm_engine.model_executor.__dict__:
-        llm.llm_engine.model_executor._run_workers(
-            "minference_patch_vllm_tp",
-            config_file=config_file,
-            patch_config=patch_config,
-        )
-    else:
-        llm.llm_engine.model_executor.driver_worker.model_runner.model.apply(
-            minference_patch_vllm_executor(config_file, patch_config)
-        )
+    # vLLM >= 0.9.0 uses collective_rpc API with V1 engine
+    # This works for both single GPU and tensor parallel cases
+    llm.collective_rpc(
+        _apply_minference_patch_to_worker,
+        kwargs={"config_file": config_file, "patch_config": patch_config},
+    )
 
     print("Patched model for minference with vLLM..")
     return llm
