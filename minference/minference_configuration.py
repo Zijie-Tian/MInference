@@ -50,6 +50,8 @@ class MInferenceConfig:
         kv_cache_cpu_device: str = "cpu",
         kv_type: str = "dense",
         is_search: bool = False,
+        profile_dir: str = None,
+        profile_layers: list = None,
         attn_kwargs: dict = {},
         **kwargs,
     ):
@@ -68,6 +70,8 @@ class MInferenceConfig:
         self.config_path = self.update_config_path(config_path, model_name)
         self.model_name = model_name
         self.is_search = is_search
+        self.profile_dir = profile_dir
+        self.profile_layers = profile_layers
         self.starting_layer = starting_layer
         self.kv_cache_cpu = kv_cache_cpu
         self.kv_cache_cpu_device = kv_cache_cpu_device
@@ -76,6 +80,8 @@ class MInferenceConfig:
             "is_search": is_search,
             "starting_layer": starting_layer,
             "config_path": config_path,
+            "profile_dir": profile_dir,
+            "profile_layers": profile_layers,
             **attn_kwargs,
         }
         if kv_type == "leank":

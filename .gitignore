@@ -416,3 +416,4 @@ build/
 *.so
 dist
 prompt_hardest.txt
+tools/profiles

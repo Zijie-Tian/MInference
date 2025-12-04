@@ -88,6 +88,10 @@ def init_minference_parameters(self):
     self.starting_layer = config.get("starting_layer", 0)
     self.is_search = config.get("is_search", False)
 
+    # Profile parameters for saving attention patterns
+    self.profile_dir = config.get("profile_dir", None)
+    self.profile_layers = config.get("profile_layers", None)
+
     self.ne_inf = None
     self.config_path = config.get("config_path", "")
     if (
@@ -126,7 +130,7 @@ def gather_qkv(q, k, v, attention_mask):
     attn_output = torch.matmul(attn_weights, v)
     return attn_output
 
-def search_pattern(q, k, head):
+def search_pattern(q, k, head, profile_dir=None, profile_layers=None, current_layer=0):
     """
     Search for the optimal sparse attention pattern for a given attention head.
 
@@ -137,9 +141,19 @@ def search_pattern(q, k, head):
         q: Query tensor, shape [batch, 1, seq_len, head_dim]
         k: Key tensor, shape [batch, 1, seq_len, head_dim]
         head: Head index (for logging)
+        profile_dir: Directory to save profile data. None = no profiling.
+        profile_layers: List of layer indices to profile. None = all layers.
+                        Example: [0, 5, 10] only profiles layers 0, 5, 10.
+        current_layer: Current layer index (for file naming and filtering)
 
     Returns:
         Tuple of (pattern_type, vertical_size, slash_size, score)
+
+    Profile Output (when profile_dir is set):
+        Saves {profile_dir}/layer{current_layer}_head{head}.npz containing:
+        - attn_weights: Full attention weights [1, 1, seq_len, seq_len]
+        - mask: Best sparse mask [1, 1, seq_len, seq_len]
+        - pattern_type, vertical_size, slash_size, score, sparsity_ratio
 
     all_info format: [pattern_type, vertical_size, slash_size, score, sparsity_ratio]
         - sparsity_ratio: fraction of attention elements selected vs full causal attention
@@ -238,29 +252,38 @@ def search_pattern(q, k, head):
 
         # Step 3: Find important diagonal lines (sum attention along each diagonal)
         slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]  # Diagonal sums
+        del qk  # Free probe attention memory
         slash[...,-30:] = torch.inf  # Force keep last 30 diagonals (recent context)
-        slash_topk = slash
-        slash = torch.topk(slash, slash_size, -1).indices - (q_len - 1)  # Top-k diagonal indices
-        # Build sparse diagonal mask matrix
-        slash = torch.stack([torch.sparse.spdiags(torch.ones(slash_size, q_len), slash.cpu()[0][_], (q_len, q_len)).to_dense() for _ in range(1)]).to(q.device)
+        slash_indices = torch.topk(slash, slash_size, -1).indices - (q_len - 1)  # Top-k diagonal indices
+        del slash  # Free memory
+        # Build sparse diagonal mask matrix (use half precision)
+        slash_mask = torch.stack([torch.sparse.spdiags(torch.ones(slash_size, q_len), slash_indices.cpu()[0][_], (q_len, q_len)).to_dense() for _ in range(1)]).half().to(q.device)
+        del slash_indices  # Free memory
 
-        # Step 4: Combine vertical and slash masks
-        est_attn = torch.ones_like(attn_weights)
-        dim = 3
-        est_attn = est_attn.scatter(3, vertical_topk.expand(*est_attn.shape[:dim], vertical_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)  # Remove unimportant columns
-        est_attn = est_attn + slash  # Add diagonal mask
+        # Step 4: Combine vertical and slash masks (memory-efficient with half precision)
+        # Start with ones, scatter zeros to columns to remove, use half precision
+        est_attn = torch.ones(1, 1, q_len, q_len, device=q.device, dtype=torch.float16)
+        est_attn.scatter_(3, vertical_topk.expand(1, 1, q_len, vertical_topk.shape[-1]), 0)  # Remove unimportant columns
+        del vertical_topk  # Free memory
+        # Add slash mask
+        est_attn = est_attn + slash_mask
+        del slash_mask  # Free memory
 
         # Step 5: Finalize mask and compute score
-        est_attn = (est_attn > 0).float()    # Binarize (handle overlaps)
+        est_attn = (est_attn > 0).half()     # Binarize (handle overlaps), stay in half precision
         est_attn = torch.tril(est_attn)       # Apply causal mask
-        attn_weights_x = attn_weights * est_attn
+        attn_weights_half = attn_weights.half()
+        attn_weights_x = attn_weights_half * est_attn
+        del attn_weights_half  # Free memory
         res3 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
+        del attn_weights_x  # Free memory
 
         # Step 6: Compute sparsity ratio (sparse elements / full causal elements)
-        num_sparse = est_attn.sum().item()
+        # Convert to float32 before sum to avoid overflow with large matrices
+        num_sparse = est_attn.float().sum().item()
         num_full = q_len * (q_len + 1) / 2  # Causal mask has N*(N+1)/2 elements
         sparsity_ratio = num_sparse / num_full
-        return res3, sparsity_ratio
+        return res3, sparsity_ratio, est_attn.float()
 
     def stream_llm(vertical_size, slash_size):
         """
@@ -286,22 +309,25 @@ def search_pattern(q, k, head):
         """
         q_len = q.shape[2]
 
-        # Build sliding window mask: keep only last slash_size positions
-        mask = torch.triu(torch.tril(torch.ones(q_len, q_len), 0), -slash_size).to(q)
+        # Build sliding window mask: keep only last slash_size positions (use half precision)
+        mask = torch.triu(torch.tril(torch.ones(q_len, q_len, dtype=torch.float16, device=q.device), 0), -slash_size)
         # Add sink tokens: first vertical_size columns always visible
         mask[:,:vertical_size] = 1
         mask = mask.unsqueeze(0).unsqueeze(1)
 
         # Compute score
         est_attn = torch.tril(mask)
-        attn_weights_x = attn_weights * est_attn
+        del mask  # Free memory
+        attn_weights_x = attn_weights.half() * est_attn
         res3 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
+        del attn_weights_x  # Free memory
 
         # Compute sparsity ratio (sparse elements / full causal elements)
-        num_sparse = est_attn.sum().item()
+        # Convert to float32 before sum to avoid overflow with large matrices
+        num_sparse = est_attn.float().sum().item()
         num_full = q_len * (q_len + 1) / 2  # Causal mask has N*(N+1)/2 elements
         sparsity_ratio = num_sparse / num_full
-        return res3, sparsity_ratio
+        return res3, sparsity_ratio, est_attn.float()
 
     def block_sparse(topk_ratio, slash_size=None):
         """
@@ -346,28 +372,34 @@ def search_pattern(q, k, head):
 
         # Step 2: Compute block-level attention scores
         qk = torch.matmul(block_q, block_k.transpose(2, 3)) + attention_mask[:,:,:block_num,:block_num]
+        del block_q, block_k  # Free memory
         # qk shape: [1, 1, block_num, block_num]
 
         # Step 3: Select top-k blocks per query block
-        est_attn = torch.ones_like(qk)
+        block_mask = torch.ones_like(qk)
         block_topk = torch.topk(-qk, block_num - block_num//topk_ratio, -1).indices  # Blocks to REMOVE
+        del qk  # Free memory
 
         dim = 3
-        est_attn = est_attn.scatter(3, block_topk.expand(*est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)
+        block_mask = block_mask.scatter(3, block_topk.expand(*block_mask.shape[:dim], block_topk.shape[dim], *block_mask.shape[dim + 1 :]), 0)
+        del block_topk  # Free memory
 
-        # Step 4: Expand block mask back to full resolution (32x32 per block)
-        est_attn = est_attn.unsqueeze(3).unsqueeze(-1).repeat(1,1,1,32,1,32).reshape(1,1,block_num * 32, block_num * 32)[...,:q_len,:q_len]
+        # Step 4: Expand block mask back to full resolution (32x32 per block), use half precision
+        est_attn = block_mask.unsqueeze(3).unsqueeze(-1).repeat(1,1,1,32,1,32).reshape(1,1,block_num * 32, block_num * 32)[...,:q_len,:q_len].half()
+        del block_mask  # Free memory
         est_attn = torch.tril(est_attn)  # Apply causal mask
 
         # Step 5: Compute score
-        attn_weights_x = attn_weights * est_attn
+        attn_weights_x = attn_weights.half() * est_attn
         res2 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
+        del attn_weights_x  # Free memory
 
         # Compute sparsity ratio (sparse elements / full causal elements)
-        num_sparse = est_attn.sum().item()
+        # Convert to float32 before sum to avoid overflow with large matrices
+        num_sparse = est_attn.float().sum().item()
         num_full = q_len * (q_len + 1) / 2  # Causal mask has N*(N+1)/2 elements
         sparsity_ratio = num_sparse / num_full
-        return res2, sparsity_ratio
+        return res2, sparsity_ratio, est_attn.float()
 
     # =========================================================================
     # Main Search Logic
@@ -401,6 +433,8 @@ def search_pattern(q, k, head):
     # | block_sparse       | (8, 1)                              |
     # +----------------------------------------------------------+
     best_s, best_v, best_score, best_ty = 0, 0, 0, ""
+    best_mask = None
+    best_sparsity = 0.0
     all_info = []
     for ty, fc in [("stream_llm", stream_llm), ("vertical_and_slash", vertical_and_slash), ("block_sparse", block_sparse)]:
         if ty == "stream_llm":
@@ -413,7 +447,7 @@ def search_pattern(q, k, head):
         print("Type : {}".format(ty))
 
         for v_size, s_size in vs_list:
-            score, sparsity_ratio = fc(v_size, s_size)
+            score, sparsity_ratio, mask = fc(v_size, s_size)
             score = score.item()
             all_info.append([ty, v_size, s_size, score, sparsity_ratio])
 
@@ -424,6 +458,47 @@ def search_pattern(q, k, head):
                 best_score = score
                 best_s, best_v = s_size, v_size
                 best_ty = ty
+                # Free old best_mask before replacing
+                if best_mask is not None:
+                    del best_mask
+                best_mask = mask
+                best_sparsity = sparsity_ratio
+            else:
+                # Free current mask if not best
+                del mask
+
+        # Clear CUDA cache between pattern types
+        torch.cuda.empty_cache()
+
+    # =========================================================================
+    # Profile Saving (if enabled)
+    # =========================================================================
+    if profile_dir is not None:
+        # Check if this layer should be profiled
+        should_profile = (profile_layers is None or current_layer in profile_layers)
+        if should_profile:
+            import numpy as np
+            os.makedirs(profile_dir, exist_ok=True)
+
+            # Save attention weights and best mask to npz
+            # Squeeze to remove batch/head dims: [1,1,seq,seq] -> [seq,seq]
+            # Convert to float32 for numpy compatibility (bfloat16 not supported)
+            save_path = os.path.join(profile_dir, f"layer{current_layer}_head{head}.npz")
+            np.savez_compressed(
+                save_path,
+                attn_weights=attn_weights.squeeze().float().cpu().numpy(),  # [seq_len, seq_len]
+                mask=best_mask.squeeze().float().cpu().numpy(),             # [seq_len, seq_len]
+                pattern_type=best_ty,
+                vertical_size=best_v,
+                slash_size=best_s,
+                score=best_score,
+                sparsity_ratio=best_sparsity,
+            )
+            print(f"\t Profile saved to: {save_path}")
+
+    # Free GPU memory for next head
+    del attn_weights, best_mask
+    torch.cuda.empty_cache()
 
     # Convert all patterns to vertical_and_slash for unified kernel execution
     # (MInference only implements V-S kernel, so we map other patterns to it)
@@ -776,7 +851,12 @@ def minference_forward():
                 k = key_states[:, head, :, :].unsqueeze(1)
                 v = value_states[:, head, :, :].unsqueeze(1)
                 if self.is_search and self.layer_idx >= len(config_list):
-                    config[head] = search_pattern(q, k, head)
+                    config[head] = search_pattern(
+                        q, k, head,
+                        profile_dir=self.profile_dir,
+                        profile_layers=self.profile_layers,
+                        current_layer=self.layer_idx
+                    )
                 if self.layer_idx >= self.starting_layer and not self.is_search:
                     attn_output = self.gather_last_q_vertical_slash_topk_v4(q, k, v, head)
                 elif is_flash_attn_2_available():
@@ -846,6 +926,8 @@ def minference_prefill_forward(
     starting_layer = prefill_kwargs["attn_forward_config"].get("starting_layer", 0)
     is_search = prefill_kwargs["attn_forward_config"].get("is_search", False)
     config_path = prefill_kwargs["attn_forward_config"].get("config_path", None)
+    profile_dir = prefill_kwargs["attn_forward_config"].get("profile_dir", None)
+    profile_layers = prefill_kwargs["attn_forward_config"].get("profile_layers", None)
     layer_idx = prefill_kwargs["layer_idx"]
     num_hidden_layers = prefill_kwargs["num_hidden_layers"]
 
@@ -868,7 +950,12 @@ def minference_prefill_forward(
         k = key_states[:, head, :, :].unsqueeze(1)
         v = value_states[:, head, :, :].unsqueeze(1)
         if is_search and layer_idx >= len(config_list):
-            new_config[head] = search_pattern(q, k, head)
+            new_config[head] = search_pattern(
+                q, k, head,
+                profile_dir=profile_dir,
+                profile_layers=profile_layers,
+                current_layer=layer_idx
+            )
         if layer_idx >= starting_layer and not is_search:
             attn_output = minference_prefill_kernel(q, k, v, head, layer_idx, prefill_kwargs["attn_forward_config"])
         else:

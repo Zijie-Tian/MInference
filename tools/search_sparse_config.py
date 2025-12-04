@@ -112,6 +112,8 @@ def search_sparse_config(
     trust_remote_code: bool = False,
     resume: bool = True,
     attn_impl: str = "flash_attention_2",
+    profile_dir: Optional[str] = None,
+    profile_layers: Optional[list] = None,
 ):
     """
     Search for optimal sparse attention patterns for a model.
@@ -125,6 +127,8 @@ def search_sparse_config(
         dtype: Model dtype ("auto", "float16", "bfloat16")
         trust_remote_code: Whether to trust remote code
         resume: Whether to resume from existing partial config
+        profile_dir: Directory to save attention profile data (npz files)
+        profile_layers: List of layer indices to profile. None = all layers.
     """
     print(f"=" * 60)
     print(f"MInference Sparse Pattern Search")
@@ -132,6 +136,9 @@ def search_sparse_config(
     print(f"Model: {model_name}")
     print(f"Output: {output_path}")
     print(f"Sequence Length: {seq_length}")
+    if profile_dir:
+        print(f"Profile Dir: {profile_dir}")
+        print(f"Profile Layers: {profile_layers if profile_layers else 'all'}")
     print(f"=" * 60)
 
     # Check for existing config
@@ -207,6 +214,8 @@ def search_sparse_config(
         model_name=model_name,
         config_path=output_path,
         is_search=True,  # Enable search mode
+        profile_dir=profile_dir,
+        profile_layers=profile_layers,
     )
     model = minference_patch(model)
 
@@ -348,8 +357,25 @@ Examples:
         action="store_true",
         help="Don't resume from existing partial config",
     )
+    parser.add_argument(
+        "--profile_dir",
+        type=str,
+        default=None,
+        help="Directory to save attention profile data (attn_weights and masks as .npz files)",
+    )
+    parser.add_argument(
+        "--profile_layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of layer indices to profile (e.g., '0,5,10'). Default: all layers",
+    )
 
     args = parser.parse_args()
+
+    # Parse profile_layers from comma-separated string to list
+    profile_layers = None
+    if args.profile_layers:
+        profile_layers = [int(x.strip()) for x in args.profile_layers.split(",")]
 
     search_sparse_config(
         model_name=args.model_name,
@@ -361,6 +387,8 @@ Examples:
         trust_remote_code=args.trust_remote_code,
         resume=not args.no_resume,
         attn_impl=args.attn_impl,
+        profile_dir=args.profile_dir,
+        profile_layers=profile_layers,
     )
 
 
