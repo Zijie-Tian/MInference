@@ -127,70 +127,253 @@ def gather_qkv(q, k, v, attention_mask):
     return attn_output
 
 def search_pattern(q, k, head):
+    """
+    Search for the optimal sparse attention pattern for a given attention head.
+
+    This function evaluates different sparse patterns and finds the one that
+    preserves the most attention weight while reducing computation.
+
+    Args:
+        q: Query tensor, shape [batch, 1, seq_len, head_dim]
+        k: Key tensor, shape [batch, 1, seq_len, head_dim]
+        head: Head index (for logging)
+
+    Returns:
+        Tuple of (pattern_type, vertical_size, slash_size, score)
+
+    all_info format: [pattern_type, vertical_size, slash_size, score, sparsity_ratio]
+        - sparsity_ratio: fraction of attention elements selected vs full causal attention
+          sparsity_ratio = num_sparse_elements / (seq_len * (seq_len + 1) / 2)
+
+    Sparse Pattern Types:
+    ====================
+
+    1. vertical_and_slash: Dynamic vertical columns + diagonal stripes
+       +------------------------------------------+
+       |  k0   k1   k2   k3   k4   k5   k6   k7   |
+       +------------------------------------------+
+       |   *              *                       | q0
+       |   *    *         *                       | q1
+       |   *         *    *                       | q2
+       |   *    *              *                  | q3
+       |   *                        *             | q4
+       |   *    *                        *        | q5
+       +------------------------------------------+
+            ^    ^                   \--------\
+         vertical cols            slash diagonals
+        (global tokens)           (local context)
+
+    2. stream_llm: Fixed sink tokens + sliding window
+       +------------------------------------------+
+       |  k0   k1   k2   k3   k4   k5   k6   k7   |
+       +------------------------------------------+
+       |   *    *                                 | q0
+       |   *    *    *                            | q1
+       |   *    *    *    *                       | q2
+       |   *    *              *    *             | q3
+       |   *    *                   *    *        | q4
+       |   *    *                        *    *   | q5
+       +------------------------------------------+
+            ^----^                   \--------\
+         sink tokens              sliding window
+         (fixed cols)             (recent tokens)
+
+    3. block_sparse: Block-level sparsity (32x32 blocks)
+       +------------------------------------------+
+       |  blk0  |  blk1  |  blk2  |  blk3  |      |
+       +------------------------------------------+
+       |  ****  |        |        |        | blk0 |
+       |  ****  |  ****  |        |        | blk1 |
+       |        |  ****  |  ****  |        | blk2 |
+       |  ****  |        |  ****  |  ****  | blk3 |
+       +------------------------------------------+
+         select top-k important blocks per row
+
+    Score Calculation:
+    =================
+    score = (attn_weights * sparse_mask)[:,:,2500:].sum(-1).mean(-1)
+
+    - Skip first 2500 queries (too short for meaningful sparse evaluation)
+    - Sum attention weights preserved by sparse mask
+    - Higher score = better pattern (preserves more attention)
+    """
     q_len = q.shape[2]
     head_dim = q.shape[-1]
 
     def vertical_and_slash(vertical_size, slash_size):
+        """
+        Evaluate vertical + slash sparse pattern.
+
+        Uses last 64 queries as probes to discover important positions:
+        - Vertical: columns with high total attention (global important tokens)
+        - Slash: diagonals with high total attention (local context patterns)
+
+        Probe Attention (last 64 queries):
+        +------------------------------------------+
+        |  k0   k1   k2   ...  k_n-64  ...  k_n    |
+        +------------------------------------------+
+        | 0.3  0.1  0.05  ...   0.01   ...  0.02  | q[-64]  probe
+        | 0.25 0.15 0.03  ...   0.02   ...  0.03  | q[-63]  queries
+        | ...                                     |   ...
+        | 0.2  0.1  0.02  ...   0.05   ...  0.1   | q[-1]
+        +------------------------------------------+
+              |         sum along             |
+              v         query dim             v
+        vertical = [5.2, 3.1, 0.5, ..., 0.8]  -> select top-k columns
+        slash = sum_all_diagonal(qk)          -> select top-k diagonals
+        """
         last_q = 64
         q_len = q.shape[2]
-        qk_idxs = [ii + q_len for ii in list(range(-last_q, 0, 1))]
+
+        # Step 1: Use last 64 queries as probes to compute attention scores
+        qk_idxs = [ii + q_len for ii in list(range(-last_q, 0, 1))]  # indices: [-64, -63, ..., -1]
         qk = torch.matmul(q[:,:,qk_idxs,:], k.transpose(2, 3))/ math.sqrt(head_dim) + attention_mask[:,:,qk_idxs]
         qk = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
-        vertical = qk.sum(-2, keepdim=True)
-        vertical[...,:30] = torch.inf
-        vertical_topk = torch.topk(-vertical, q_len - vertical_size, -1).indices
+        # qk shape: [1, 1, 64, seq_len] - probe attention scores
 
-        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
-        slash[...,-30:] = torch.inf
+        # Step 2: Find important vertical columns (sum attention across probe queries)
+        vertical = qk.sum(-2, keepdim=True)  # [1, 1, 1, seq_len] - total attention per column
+        vertical[...,:30] = torch.inf        # Force keep first 30 columns (BOS, etc.)
+        vertical_topk = torch.topk(-vertical, q_len - vertical_size, -1).indices  # Columns to REMOVE
+
+        # Step 3: Find important diagonal lines (sum attention along each diagonal)
+        slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]  # Diagonal sums
+        slash[...,-30:] = torch.inf  # Force keep last 30 diagonals (recent context)
         slash_topk = slash
-        slash = torch.topk(slash, slash_size, -1).indices - (q_len - 1)
+        slash = torch.topk(slash, slash_size, -1).indices - (q_len - 1)  # Top-k diagonal indices
+        # Build sparse diagonal mask matrix
         slash = torch.stack([torch.sparse.spdiags(torch.ones(slash_size, q_len), slash.cpu()[0][_], (q_len, q_len)).to_dense() for _ in range(1)]).to(q.device)
 
+        # Step 4: Combine vertical and slash masks
         est_attn = torch.ones_like(attn_weights)
         dim = 3
-        est_attn = est_attn.scatter(3, vertical_topk.expand(*est_attn.shape[:dim], vertical_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)
-        est_attn = est_attn + slash
+        est_attn = est_attn.scatter(3, vertical_topk.expand(*est_attn.shape[:dim], vertical_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)  # Remove unimportant columns
+        est_attn = est_attn + slash  # Add diagonal mask
 
-        est_attn = (est_attn > 0).float()
-        est_attn = torch.tril(est_attn)
+        # Step 5: Finalize mask and compute score
+        est_attn = (est_attn > 0).float()    # Binarize (handle overlaps)
+        est_attn = torch.tril(est_attn)       # Apply causal mask
         attn_weights_x = attn_weights * est_attn
         res3 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
-        return res3
+
+        # Step 6: Compute sparsity ratio (sparse elements / full causal elements)
+        num_sparse = est_attn.sum().item()
+        num_full = q_len * (q_len + 1) / 2  # Causal mask has N*(N+1)/2 elements
+        sparsity_ratio = num_sparse / num_full
+        return res3, sparsity_ratio
 
     def stream_llm(vertical_size, slash_size):
+        """
+        Evaluate StreamLLM / A-shape sparse pattern.
+
+        Fixed pattern: sink tokens (first columns) + sliding window (recent tokens)
+        No dynamic selection - pattern is predetermined by parameters.
+
+        Mask Structure (vertical_size=2, slash_size=3):
+        +------------------------------------------+
+        |  k0   k1   k2   k3   k4   k5   k6   k7   |
+        +------------------------------------------+
+        |   *    *                                 | q0  sink only
+        |   *    *    *                            | q1  sink + window
+        |   *    *    *    *                       | q2
+        |   *    *         *    *    *             | q3
+        |   *    *              *    *    *        | q4
+        |   *    *                   *    *    *   | q5
+        +------------------------------------------+
+             ^----^                   ^--------^
+           sink tokens              sliding window
+         (first vertical_size)     (last slash_size)
+        """
         q_len = q.shape[2]
 
+        # Build sliding window mask: keep only last slash_size positions
         mask = torch.triu(torch.tril(torch.ones(q_len, q_len), 0), -slash_size).to(q)
+        # Add sink tokens: first vertical_size columns always visible
         mask[:,:vertical_size] = 1
         mask = mask.unsqueeze(0).unsqueeze(1)
 
+        # Compute score
         est_attn = torch.tril(mask)
         attn_weights_x = attn_weights * est_attn
         res3 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
-        return res3
+
+        # Compute sparsity ratio (sparse elements / full causal elements)
+        num_sparse = est_attn.sum().item()
+        num_full = q_len * (q_len + 1) / 2  # Causal mask has N*(N+1)/2 elements
+        sparsity_ratio = num_sparse / num_full
+        return res3, sparsity_ratio
 
     def block_sparse(topk_ratio, slash_size=None):
+        """
+        Evaluate block-level sparse pattern.
+
+        Divides the attention matrix into 32x32 blocks and selects top-k blocks.
+        Each query block attends to selected key blocks only.
+
+        Block-level Processing:
+        +------------------------------------------+
+        | Original: 8192 tokens                    |
+        | -> 256 blocks (32 tokens each)           |
+        +------------------------------------------+
+
+        Block Attention Matrix (256 x 256):
+        +------------------------------------------+
+        |  blk0  |  blk1  |  blk2  |  blk3  | ...  |
+        +------------------------------------------+
+        |  ****  |        |        |        | blk0 |
+        |  ****  |  ****  |        |        | blk1 |
+        |        |  ****  |  ****  |        | blk2 |
+        |  ****  |        |  ****  |  ****  | blk3 |
+        +------------------------------------------+
+           ^                  ^
+           |                  |
+        selected blocks    each 32x32
+        (top-k per row)    expanded back
+
+        Args:
+            topk_ratio: Keep 1/topk_ratio of blocks per row
+        """
         block_num = (q_len -1) // 32 + 1
+
+        # Step 1: Compute block-level representations (average pooling)
         block_q = torch.zeros(1,1,block_num * 32,head_dim).to(q)
         block_q[:,:,:q_len] = q
-        block_q = block_q.reshape(1,1,block_num,32,-1).mean(-2)
+        block_q = block_q.reshape(1,1,block_num,32,-1).mean(-2)  # [1,1,block_num,head_dim]
+
         block_k = torch.zeros(1,1,block_num * 32,head_dim).to(k)
         block_k[:,:,:q_len] = k
-        block_k = block_k.reshape(1,1,block_num,32,-1).mean(-2)
+        block_k = block_k.reshape(1,1,block_num,32,-1).mean(-2)  # [1,1,block_num,head_dim]
 
+        # Step 2: Compute block-level attention scores
         qk = torch.matmul(block_q, block_k.transpose(2, 3)) + attention_mask[:,:,:block_num,:block_num]
+        # qk shape: [1, 1, block_num, block_num]
+
+        # Step 3: Select top-k blocks per query block
         est_attn = torch.ones_like(qk)
-        block_topk = torch.topk(-qk, block_num - block_num//topk_ratio, -1).indices
+        block_topk = torch.topk(-qk, block_num - block_num//topk_ratio, -1).indices  # Blocks to REMOVE
 
         dim = 3
         est_attn = est_attn.scatter(3, block_topk.expand(*est_attn.shape[:dim], block_topk.shape[dim], *est_attn.shape[dim + 1 :]), 0)
-        est_attn = est_attn.unsqueeze(3).unsqueeze(-1).repeat(1,1,1,32,1,32).reshape(1,1,block_num * 32, block_num * 32)[...,:q_len,:q_len]
-        est_attn = torch.tril(est_attn)
 
+        # Step 4: Expand block mask back to full resolution (32x32 per block)
+        est_attn = est_attn.unsqueeze(3).unsqueeze(-1).repeat(1,1,1,32,1,32).reshape(1,1,block_num * 32, block_num * 32)[...,:q_len,:q_len]
+        est_attn = torch.tril(est_attn)  # Apply causal mask
+
+        # Step 5: Compute score
         attn_weights_x = attn_weights * est_attn
         res2 = attn_weights_x[:,:,2500:].sum(-1).mean(-1).squeeze().float().detach().cpu().numpy()
-        return res2
 
+        # Compute sparsity ratio (sparse elements / full causal elements)
+        num_sparse = est_attn.sum().item()
+        num_full = q_len * (q_len + 1) / 2  # Causal mask has N*(N+1)/2 elements
+        sparsity_ratio = num_sparse / num_full
+        return res2, sparsity_ratio
+
+    # =========================================================================
+    # Main Search Logic
+    # =========================================================================
+
+    # Build causal attention mask (cached globally for efficiency)
     global SEARCH_MASK
     if SEARCH_MASK is None:
         attention_mask = torch.full((q_len, q_len), torch.finfo(q.dtype).min, device="cuda")
@@ -200,8 +383,23 @@ def search_pattern(q, k, head):
         SEARCH_MASK = attention_mask
     else:
         attention_mask = SEARCH_MASK.to(q.device)
+
+    # Compute full attention weights (ground truth for comparison)
+    # attn_weights shape: [1, 1, seq_len, seq_len]
     attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim) + attention_mask
     attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+
+    # Search over all pattern types and parameter combinations
+    # Goal: find (pattern_type, vertical_size, slash_size) that maximizes score
+    #
+    # Search Space:
+    # +----------------------------------------------------------+
+    # | Pattern Type       | (vertical_size, slash_size) configs |
+    # +----------------------------------------------------------+
+    # | stream_llm         | (100, 800)                          |
+    # | vertical_and_slash | (30,800) (100,750) (500,700) (3500,100)|
+    # | block_sparse       | (8, 1)                              |
+    # +----------------------------------------------------------+
     best_s, best_v, best_score, best_ty = 0, 0, 0, ""
     all_info = []
     for ty, fc in [("stream_llm", stream_llm), ("vertical_and_slash", vertical_and_slash), ("block_sparse", block_sparse)]:
@@ -211,18 +409,29 @@ def search_pattern(q, k, head):
             vs_list = [(30, 800), (100, 750), (500, 700), (3500, 100)]
         else:
             vs_list = [(8, 1)]
+
+        print("Type : {}".format(ty))
+
         for v_size, s_size in vs_list:
-            score = fc(v_size, s_size)
+            score, sparsity_ratio = fc(v_size, s_size)
             score = score.item()
-            all_info.append([ty, v_size, s_size, score])
+            all_info.append([ty, v_size, s_size, score, sparsity_ratio])
+
+            print("\t v_size {}, s_size {}, score {}, sparsity {:.4f}".format(v_size, s_size, score, sparsity_ratio))
+
+            # Track best configuration (highest score = most attention preserved)
             if score > best_score:
                 best_score = score
                 best_s, best_v = s_size, v_size
                 best_ty = ty
+
+    # Convert all patterns to vertical_and_slash for unified kernel execution
+    # (MInference only implements V-S kernel, so we map other patterns to it)
     if best_ty == "stream_llm":
         best_ty = "vertical_and_slash"
     if best_ty == "block_sparse":
         best_ty, best_v, best_s = "vertical_and_slash", 1000, 6096
+
     print(head, best_ty, best_v, best_s, best_score)
     return (best_ty, best_v, best_s, best_score)
 
