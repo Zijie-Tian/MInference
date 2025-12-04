@@ -346,7 +346,99 @@ python experiments/microbench/bench_vertical_slash.py \
 
 ---
 
-## 7. Summary
+## 7. KV Cache Quantization Integration
+
+### 7.1 Execution Order: Attention First, Then Quantization
+
+**Standard Engineering Practice:**
+```
++================================================================+
+|                    PREFILL PHASE                                |
++================================================================+
+| Step 1: Compute Q, K, V (FP16)                                  |
+| Step 2: Compute Attention with FP16 K, V (full precision!)      |
+| Step 3: Quantize K, V → INT4/FP8                                |
+| Step 4: Store quantized K, V to cache                           |
++================================================================+
+
++================================================================+
+|                    DECODE PHASE                                 |
++================================================================+
+| Step 1: Load quantized K, V from cache                          |
+| Step 2: Dequantize OR Mixed-Precision Attention                 |
+| Step 3: Quantize new token's K, V                               |
+| Step 4: Append to cache                                         |
++================================================================+
+```
+
+**Why Attention Before Quantization?**
+| Reason | Explanation |
+|--------|-------------|
+| Precision | Prefill uses original FP16, no quantization error |
+| Data Locality | K, V just computed, still in SRAM/registers |
+| Error Accumulation | Quantization error only affects decode phase |
+
+### 7.2 Mixed-Precision GEMV (FP16 × INT4)
+
+KIVI uses fused dequantization + GEMM instead of explicit dequantization:
+
+```
+Explicit Dequant (slow):          Fused Mixed-Precision (fast):
++---------------------------+     +---------------------------+
+| Load K_int4               |     | Load K_int4               |
+| Dequant → K_fp16 (store)  |     | Fused: K*scale+zero → GEMM|
+| Load K_fp16               |     | (no intermediate tensor)  |
+| GEMM: Q @ K_fp16          |     +---------------------------+
++---------------------------+
+Memory: 4.5x                      Memory: 0.5x
+```
+
+### 7.3 Combining Sparse Attention + KV Quantization
+
+| Optimization | Target | Reduction |
+|--------------|--------|-----------|
+| Sparse Attention | Computation | 10-20× fewer blocks |
+| KV Quantization | Memory | 4-8× less bandwidth |
+| **Combined** | **Both** | **40-160× improvement** |
+
+**For detailed analysis, see: `docs/kv_cache_quantization.md`**
+
+---
+
+## 8. Prefill vs Decode Optimization
+
+### 8.1 Phase Characteristics
+
+| Phase | Complexity | Bottleneck | MInference Optimization |
+|-------|-----------|------------|------------------------|
+| Prefill | O(N²) | Compute | Sparse Attention (V-S pattern) |
+| Decode | O(N) | Memory | Dense/Quest (KV cache) |
+
+### 8.2 Why Vertical-Slash is Prefill-Only
+
+```
+Prefill: N×N Attention Matrix       Decode: 1×N Attention Vector
++---------------------------+       +---------------------------+
+|■                          |       |                           |
+|■ ■                        |       | q  [? ? ? ? ? ? ? ?]      |
+|■ ■ ■                      |       |     ↑                     |
+|■ ■ ■ ■                    |       |   Only 1 row!             |
+|■ ■ ■ ■ ■                  |       |   No diagonal pattern     |
+|■ ■ ■ ■ ■ ■                |       |                           |
++---------------------------+       +---------------------------+
+  2D pattern (V-S works)              1D vector (V-S not applicable)
+```
+
+**Decode Optimization Options:**
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| Dense | Standard attention | Short context |
+| Quest | Query-aware chunk selection | Long context |
+| StreamingLLM | Keep first + recent tokens | Very long context |
+
+---
+
+## 9. Summary
 
 **MInference Core Innovations:**
 | Innovation | Description |
@@ -360,3 +452,15 @@ python experiments/microbench/bench_vertical_slash.py \
 | Sparsity | Information Retained | Typical Speedup |
 |----------|---------------------|-----------------|
 | 5-10% | 90%+ | 10-30x |
+
+---
+
+## 10. Documentation Index
+
+| Document | Content |
+|----------|---------|
+| `docs/sparse_attention_overview.md` | Sparse pattern types, search process |
+| `docs/vertical_slash_pattern.md` | V-S pattern extraction details |
+| `docs/triton_kernel_implementation.md` | Kernel implementation, online softmax |
+| `docs/vllm_integration.md` | vLLM 0.9.0+ compatibility |
+| `docs/kv_cache_quantization.md` | KV cache quantization + attention order |
