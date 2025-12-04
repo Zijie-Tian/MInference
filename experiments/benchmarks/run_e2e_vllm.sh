@@ -1,9 +1,8 @@
 # Copyright (c) 2024 Microsoft
 # Licensed under The MIT License [see LICENSE for details]
 
-# Load data
-wget https://raw.githubusercontent.com/FranxYao/chain-of-thought-hub/main/gsm8k/lib_prompt/prompt_hardest.txt
+# Load data (download only if not exists)
+[ -f prompt_hardest.txt ] || wget https://raw.githubusercontent.com/FranxYao/chain-of-thought-hub/main/gsm8k/lib_prompt/prompt_hardest.txt
 
-python experiments/benchmarks/benchmark_e2e_vllm.py \
-    --attn_type minference \
-    --context_window 100_000
+VLLM_USE_V1=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python experiments/benchmarks/benchmark_e2e_vllm.py --attn_type minference --context_window 10000

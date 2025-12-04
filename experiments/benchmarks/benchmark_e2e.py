@@ -21,8 +21,10 @@ def run_target_length(m: int, model, attn_type: str):
     new_input_ids = (input_ids * b)[:m]
     prompt = tokenizer.decode(new_input_ids)
     data = tokenizer(prompt, return_tensors="pt")
-    input_ids = data["input_ids"].cuda()
-    attention_mask = data["attention_mask"].cuda()
+    # Get the device of the model's embedding layer to handle device_map="auto"
+    device = next(model.parameters()).device
+    input_ids = data["input_ids"].to(device)
+    attention_mask = data["attention_mask"].to(device)
     s = 0
     T = 10
     for _ in range(T):
@@ -60,8 +62,8 @@ def run_benchmark(model_name: str):
     for attn_type in ATTN_TYPES:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype="auto",
-            device_map="auto",
+            torch_dtype=torch.float16,
+            device_map={"": 0},  # Force all on cuda:0
             _attn_implementation="flash_attention_2",
         )
         attn_kwargs = {} if args.attn_type != "inf_llm" else {"dense_decoding": False}
@@ -127,8 +129,8 @@ if __name__ == "__main__":
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype="auto",
-            device_map="auto",
+            torch_dtype=torch.float16,
+            device_map={"": 0},  # Force all on cuda:0
             trust_remote_code=args.trust_remote_code,
             _attn_implementation="flash_attention_2",
         )
