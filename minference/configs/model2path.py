@@ -23,6 +23,9 @@ MODEL2PATH = {
     "Qwen/Qwen2-7B-Instruct": os.path.join(
         BASE_DIR, "Qwen2_7B_Instruct_128k_instruct_kv_out_v32_fit_o_best_pattern.json"
     ),
+    "Qwen/Qwen2.5-0.5B-Instruct": os.path.join(
+        BASE_DIR, "Qwen2.5_0.5B_Instruct_sparse_config.json"
+    ),
     "Qwen/Qwen2.5-7B-Instruct": os.path.join(
         BASE_DIR,
         "Qwen2.5_7B_Instruct_128k_instruct_kv_out_v32_fit_o_best_pattern.json",

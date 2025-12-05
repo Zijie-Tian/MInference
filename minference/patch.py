@@ -1053,7 +1053,7 @@ def minference_patch_vllm_executor(config_file: str, patch_config={}):
     from collections import defaultdict
 
     import vllm
-    from vllm.attention import Attention
+    from vllm.attention.layer import Attention
     from vllm.forward_context import get_forward_context
     from vllm.model_executor.models.chatglm import (
         GLMAttention,

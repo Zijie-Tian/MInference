@@ -1489,6 +1489,11 @@ def minference_vllm_forward(
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        # Local imports for vLLM worker process
+        from vllm.attention.backends.abstract import AttentionType
+        from vllm.attention.backends.utils import get_num_prefill_decode_query_kv_tokens
+        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
         # NOTE(woosuk): FlashAttention does not support FP8 KV cache.
         self.patch_config = patch_config
         self.best_pattern = {int(ii): jj for ii, jj in pattern_config[layer_idx].items()}
@@ -1648,10 +1653,11 @@ def minference_vllm_forward(
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)
 
-    if vllm_version in "0.4.1":
+    from packaging.version import parse as parse_version
+    ver = parse_version(vllm_version)
+    if ver < parse_version("0.4.2"):
         return forward
-    elif vllm_version == "0.4.2":
+    elif ver < parse_version("0.4.3"):
         return forward_vllm_042
-    elif vllm_version >= "0.4.3":
+    else:  # >= 0.4.3
         return forward_vllm_080
-    assert False, "Only support 'vllm>=0.4.1'. Please update your vllm version."
