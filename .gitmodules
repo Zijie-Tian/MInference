@@ -1,0 +1,8 @@
+[submodule "3rdparty/sglang"]
+	path = 3rdparty/sglang
+	url = https://github.com/Zijie-Tian/sglang.git
+	branch = tzj/minference
+[submodule "3rdparty/vllm"]
+	path = 3rdparty/vllm
+	url = https://github.com/Zijie-Tian/vllm.git
+	branch = tzj/minference
