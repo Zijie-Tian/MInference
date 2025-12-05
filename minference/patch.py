@@ -1098,7 +1098,17 @@ def minference_patch_vllm_executor(config_file: str, patch_config={}):
         if isinstance(attn_metadata, dict):
             attn_metadata = attn_metadata[self.layer_name]
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-        return self.impl.forward(
+
+        # Reshape tensors to match V1 FlashAttentionImpl expected format
+        # [num_tokens, hidden_size] -> [num_tokens, num_heads, head_size]
+        query = query.view(-1, self.num_heads, self.head_size)
+        output = output.view(-1, self.num_heads, self.head_size)
+        if key is not None:
+            key = key.view(-1, self.num_kv_heads, self.head_size)
+        if value is not None:
+            value = value.view(-1, self.num_kv_heads, self.head_size)
+
+        self.impl.forward(
             self,
             query,
             key,
@@ -1108,9 +1118,7 @@ def minference_patch_vllm_executor(config_file: str, patch_config={}):
             output=output,
             layer_idx=layer_idx,
         )
-        # check self._kv_scale
-        # kv_scale = getattr(self, "_kv_scale", getattr(self, "_k_scale", kv_scale))
-        return self.impl.forward(query, key, value, layer_idx)
+        return output.view(-1, hidden_size)
 
     def llama_model_forward_vllm(
         self,

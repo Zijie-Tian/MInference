@@ -1653,11 +1653,158 @@ def minference_vllm_forward(
         # Reshape the output tensor.
         return output.view(num_tokens, hidden_size)
 
+    def forward_vllm_v1(
+        self,
+        layer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor = None,
+        output_scale: torch.Tensor = None,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Forward pass with FlashAttention for vLLM V1 engine.
+
+        Args:
+            query: shape = [num_tokens, num_heads, head_size]
+            key: shape = [num_tokens, num_kv_heads, head_size]
+            value: shape = [num_tokens, num_kv_heads, head_size]
+            kv_cache: shape = [2, num_blocks, block_size, num_kv_heads, head_size]
+            attn_metadata: V1 FlashAttentionMetadata
+        Returns:
+            shape = [num_tokens, num_heads, head_size]
+        """
+        # Local imports for vLLM V1 worker process
+        from vllm.attention.backends.abstract import AttentionType
+        from vllm.distributed import get_tensor_model_parallel_rank
+        from vllm.attention.utils.fa_utils import (
+            flash_attn_varlen_func,
+            reshape_and_cache_flash,
+        )
+
+        self.patch_config = patch_config
+        self.best_pattern = {int(ii): jj for ii, jj in pattern_config[layer_idx].items()}
+
+        def repeat_kv(hidden_states, n_rep):
+            sqlen, num_head, head_dim = hidden_states.shape
+            if n_rep == 1:
+                return hidden_states
+            hidden_states = hidden_states[:, :, None, :].expand(sqlen, num_head, n_rep, head_dim)
+            return hidden_states.reshape(sqlen, num_head * n_rep, head_dim)
+
+        def minference_prefill_func(q, k, v):
+            # (seq_len, num_heads, head_size)
+            if q.size(-2) != k.size(-2):
+                k = repeat_kv(k, q.size(-2) // k.size(-2))
+                v = repeat_kv(v, q.size(-2) // v.size(-2))
+
+            out = torch.empty_like(q)
+            head_idx_st = get_tensor_model_parallel_rank() * q.size(-2)
+            for head in range(q.size(-2)):
+                q_head = q[:, head, :].unsqueeze(1)
+                k_head = k[:, head, :].unsqueeze(1)
+                v_head = v[:, head, :].unsqueeze(1)
+
+                # (1, seq_len, num_heads, head_size)
+                q_head = q_head[None, ...]
+                k_head = k_head[None, ...]
+                v_head = v_head[None, ...]
+
+                q_head = q_head.transpose(1, 2)
+                k_head = k_head.transpose(1, 2)
+                v_head = v_head.transpose(1, 2)
+
+                head_out = self.gather_last_q_vertical_slash_topk_vllm(
+                    q_head, k_head, v_head, head + head_idx_st
+                )
+
+                head_out = head_out.transpose(1, 2).squeeze(0).contiguous()
+                out[:, head:head+1, :] = head_out
+            return out
+
+        assert output is not None, "Output tensor must be provided."
+
+        if attn_metadata is None:
+            return output.fill_(0)
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        kv_cache_dtype = self.kv_cache_dtype
+
+        # Store KV to cache
+        if kv_cache.numel() > 0:
+            key_cache, value_cache = kv_cache.unbind(0)
+            if key is not None and value is not None:
+                reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+        else:
+            key_cache = None
+            value_cache = None
+
+        # Check if this is prefill (query_len > 1) or decode (query_len == 1)
+        is_prefill = attn_metadata.max_query_len > 1
+
+        if is_prefill:
+            # Prefill: use MInference sparse attention
+            q = query[:num_actual_tokens]
+            k = key[:num_actual_tokens] if key is not None else None
+            v = value[:num_actual_tokens] if value is not None else None
+
+            if k is not None and v is not None:
+                # Use MInference sparse attention for prefill
+                out = minference_prefill_func(q, k, v)
+                output[:num_actual_tokens] = out
+            else:
+                # Fallback to standard attention with KV cache
+                flash_attn_varlen_func(
+                    q=q,
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    seqused_k=attn_metadata.seq_lens,
+                    max_seqlen_k=attn_metadata.max_seq_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    block_table=attn_metadata.block_table,
+                )
+        else:
+            # Decode: use standard paged attention
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+                block_table=attn_metadata.block_table,
+            )
+
+        return output
+
     from packaging.version import parse as parse_version
     ver = parse_version(vllm_version)
     if ver < parse_version("0.4.2"):
         return forward
     elif ver < parse_version("0.4.3"):
         return forward_vllm_042
-    else:  # >= 0.4.3
+    elif ver < parse_version("0.12.0"):
         return forward_vllm_080
+    else:  # >= 0.12.0 (V1 engine)
+        return forward_vllm_v1

@@ -414,6 +414,7 @@ __pycache__
 build/
 *.egg-info/
 *.so
+*.csv
 dist
 prompt_hardest.txt
 tools/profiles
