@@ -898,7 +898,9 @@ def minference_prefill_kernel(
         slash = sum_all_diagonal_matrix(qk)[...,:-last_q + 1]
         slash[...,-100:] = torch.inf
         slash_topk = slash
-        slash = (q_len - 1) - torch.topk(slash, slash_size, -1).indices
+        # Ensure slash_size doesn't exceed the actual dimension
+        actual_slash_size = min(slash_size, slash.shape[-1])
+        slash = (q_len - 1) - torch.topk(slash, actual_slash_size, -1).indices
 
         return vertical_slash_sparse_attention(q, k, v, vertical_topk, slash)
 

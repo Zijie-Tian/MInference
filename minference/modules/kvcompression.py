@@ -369,7 +369,16 @@ class StreamingLLMKVCache(SnapKVCache):
 
 class DynamicCacheWithRepeat(DynamicCache):
     def __init__(self, config, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # Handle both MInferenceConfig and PretrainedConfig
+        # If config has get_text_config method, it's a PretrainedConfig - use it directly
+        # Otherwise, it's MInferenceConfig - create DynamicCache without config
+        if hasattr(config, 'get_text_config'):
+            # This is a PretrainedConfig from Transformers
+            super().__init__(config=config)
+        else:
+            # This is MInferenceConfig - initialize DynamicCache without config
+            # The layers will be created lazily during the first forward pass
+            super().__init__()
         self.temp_key_cache = []
         self.temp_value_cache = []
 
@@ -437,9 +446,13 @@ class DynamicCacheWithRepeat(DynamicCache):
         return key_states, value_states
 
     def get_seq_length(self, layer_idx=0):
-        if len(self.key_cache) <= layer_idx:
+        # Handle both old and new Transformers API
+        if hasattr(self, 'key_cache') and len(self.key_cache) <= layer_idx:
             return 0
-        return self._seen_tokens
+        # For new Transformers, use the parent class method
+        if hasattr(super(), 'get_seq_length'):
+            return super().get_seq_length(layer_idx)
+        return getattr(self, '_seen_tokens', 0)
 
     def clear_temp_kv_cache(self):
         if self.temp_key_cache:

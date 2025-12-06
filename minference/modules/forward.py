@@ -133,7 +133,7 @@ def attn_forward(
 
     dropout_rate = self.attention_dropout if self.training else 0.0
 
-    if not use_cache or q_len == past_key_value.get_seq_length(
+    if not use_cache or past_key_value is None or q_len == past_key_value.get_seq_length(
         self.layer_idx
     ):  # use no cache or prefilling
         # if q_len != 1: # prefilling

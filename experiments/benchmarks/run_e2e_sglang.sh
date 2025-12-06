@@ -16,6 +16,6 @@
 [ -f prompt_hardest.txt ] || wget https://raw.githubusercontent.com/FranxYao/chain-of-thought-hub/main/gsm8k/lib_prompt/prompt_hardest.txt
 
 # Use Qwen2.5-7B-Instruct-1M which has built-in dual_chunk_attention_config
-MODEL="Qwen/Qwen2.5-7B-Instruct-1M"
+MODEL="Qwen/Qwen2.5-7B-Instruct"
 
 python experiments/benchmarks/benchmark_e2e_sglang.py --run_benchmark --model_name $MODEL

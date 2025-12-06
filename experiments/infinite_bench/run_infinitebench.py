@@ -153,7 +153,7 @@ def load_model(
             model_name,
             resume_download=None,
             trust_remote_code=trust_remote_code,
-            _attn_implementation="flash_attention_2",
+            # _attn_implementation="flash_attention_2",  # Temporarily disabled due to compatibility issue
         )
         if "LWM" in model_name:
             c = {

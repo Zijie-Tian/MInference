@@ -8,6 +8,9 @@ MODEL2PATH = {
     "gradientai/Llama-3-8B-Instruct-262k": os.path.join(
         BASE_DIR, "Llama_3_8B_Instruct_262k_kv_out_v32_fit_o_best_pattern.json"
     ),
+    "/home/zijie/models/Llama-3-8B-Instruct-262k": os.path.join(
+        BASE_DIR, "Llama_3_8B_Instruct_262k_kv_out_v32_fit_o_best_pattern.json"
+    ),
     "gradientai/Llama-3-8B-Instruct-Gradient-1048k": os.path.join(
         BASE_DIR, "Llama_3_8B_Instruct_262k_kv_out_v32_fit_o_best_pattern.json"
     ),

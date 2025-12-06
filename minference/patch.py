@@ -556,8 +556,8 @@ def forward_llama_decoder_layer(
         part_hidden_states = self.mlp(part_hidden_states)
         hidden_states[:, start_idx:end_idx, :] += part_hidden_states
 
-    # Return tuple to match original Qwen2DecoderLayer.forward signature
-    return (hidden_states,)
+    # Return hidden_states directly (not as tuple) to match expected format
+    return hidden_states
 
 
 def forward_llama_model(
