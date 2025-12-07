@@ -7,13 +7,13 @@ from minference import MInference
 
 prompt = "Hello, my name is"
 
-model_name = "gradientai/Llama-3-8B-Instruct-262k"
+model_name = "/home/zijie/models/Llama-3-8B-Instruct-262k"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype="auto",
     device_map="cuda",
-    _attn_implementation="flash_attention_2",
+    attn_implementation="sdpa",  # Use PyTorch SDPA instead of flash_attention_2
 )
 
 # Patch MInference Module

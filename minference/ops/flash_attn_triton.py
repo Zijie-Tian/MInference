@@ -214,15 +214,58 @@ def _fwd_kernel(
             )
 
 def _flash_attn_triton_decoding(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False):
+    # Ensure tensors are contiguous for Triton
+    if not q.is_contiguous():
+        q = q.contiguous()
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
     assert k.shape == (batch, seqlen_k, nheads, d)
     assert v.shape == (batch, seqlen_k, nheads, d)
-    assert d <= 128, "FlashAttention only support head dimensions up to 128"
+
+    # Helper function to use PyTorch SDPA fallback
+    def _use_sdpa_fallback():
+        # Use PyTorch's scaled_dot_product_attention as fallback
+        # Input shape: [batch, seq_len, num_heads, head_dim]
+        # SDPA expects: [batch, num_heads, seq_len, head_dim]
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        scale = softmax_scale if softmax_scale is not None else (1.0 / math.sqrt(d))
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_t, k_t, v_t,
+            dropout_p=dropout_p,
+            is_causal=causal,
+            scale=scale,
+        )
+        return out.transpose(1, 2)  # Back to [batch, seq_len, num_heads, head_dim]
+
+    # Fall back to PyTorch SDPA for CPU tensors or unsupported configurations
+    # Check device type more carefully - accelerate hooks can make .is_cuda return True
+    # but the tensor may not be accessible by Triton
+    def _is_valid_cuda_tensor(t):
+        if not t.is_cuda:
+            return False
+        # Check device type explicitly
+        if t.device.type != 'cuda':
+            return False
+        # Try to access data pointer to ensure tensor is materialized
+        try:
+            _ = t.data_ptr()
+            return True
+        except:
+            return False
+
+    if not (_is_valid_cuda_tensor(q) and _is_valid_cuda_tensor(k) and _is_valid_cuda_tensor(v)) or d > 128:
+        return _use_sdpa_fallback()
+
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
-    assert q.is_cuda and k.is_cuda and v.is_cuda
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
     bias = None
@@ -255,45 +298,54 @@ def _flash_attn_triton_decoding(q, k, v, dropout_p=0.0, softmax_scale=None, caus
     BLOCK = 128
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
-    _fwd_kernel[grid](
-        q,
-        k,
-        v,
-        bias,
-        o,
-        lse,
-        tmp,
-        softmax_scale,
-        q.stride(0),
-        q.stride(2),
-        q.stride(1),
-        k.stride(0),
-        k.stride(2),
-        k.stride(1),
-        v.stride(0),
-        v.stride(2),
-        v.stride(1),
-        *bias_strides,
-        o.stride(0),
-        o.stride(2),
-        o.stride(1),
-        nheads,
-        seqlen_q,
-        seqlen_k,
-        seqlen_q_rounded,
-        d,
-        seqlen_q // 32,
-        seqlen_k // 32,  # key for triton cache (limit number of compilations)
-        # Can't use kwargs here because triton autotune expects key to be args, not kwargs
-        # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
-        bias_type,
-        causal,
-        BLOCK_HEADDIM,
-        BLOCK_M=BLOCK,
-        BLOCK_N=BLOCK,
-        num_warps=num_warps,
-        num_stages=1,
-    )
+
+    # Wrap Triton kernel call in try-except to handle accelerate/device_map issues
+    try:
+        _fwd_kernel[grid](
+            q,
+            k,
+            v,
+            bias,
+            o,
+            lse,
+            tmp,
+            softmax_scale,
+            q.stride(0),
+            q.stride(2),
+            q.stride(1),
+            k.stride(0),
+            k.stride(2),
+            k.stride(1),
+            v.stride(0),
+            v.stride(2),
+            v.stride(1),
+            *bias_strides,
+            o.stride(0),
+            o.stride(2),
+            o.stride(1),
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            seqlen_q_rounded,
+            d,
+            seqlen_q // 32,
+            seqlen_k // 32,  # key for triton cache (limit number of compilations)
+            # Can't use kwargs here because triton autotune expects key to be args, not kwargs
+            # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
+            bias_type,
+            causal,
+            BLOCK_HEADDIM,
+            BLOCK_M=BLOCK,
+            BLOCK_N=BLOCK,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+    except ValueError as e:
+        # Triton can fail with "Pointer argument cannot be accessed from Triton"
+        # when using device_map='auto' with accelerate hooks
+        if "Pointer argument" in str(e) or "cpu tensor" in str(e).lower():
+            return _use_sdpa_fallback()
+        raise
     return o #, lse, softmax_scale
 
 def torch_decoding(q, k, v):

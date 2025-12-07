@@ -368,6 +368,11 @@ class StreamingLLMKVCache(SnapKVCache):
 
 
 class DynamicCacheWithRepeat(DynamicCache):
+    """
+    Custom cache that extends DynamicCache with repeat_kv support and temp cache.
+    Compatible with both old (< 4.57) and new (>= 4.57) Transformers APIs.
+    """
+
     def __init__(self, config, *args, **kwargs):
         # Handle both MInferenceConfig and PretrainedConfig
         # If config has get_text_config method, it's a PretrainedConfig - use it directly
@@ -381,6 +386,16 @@ class DynamicCacheWithRepeat(DynamicCache):
             super().__init__()
         self.temp_key_cache = []
         self.temp_value_cache = []
+        # Initialize _seen_tokens for transformers 4.57+ compatibility
+        # (DynamicCache no longer initializes this attribute by default)
+        if not hasattr(self, '_seen_tokens'):
+            self._seen_tokens = 0
+        # For transformers 4.57+ compatibility, create key_cache/value_cache lists
+        # if they don't exist (new API uses layers[] instead)
+        if not hasattr(self, 'key_cache'):
+            self.key_cache = []
+        if not hasattr(self, 'value_cache'):
+            self.value_cache = []
 
     def update(
         self,
@@ -446,13 +461,10 @@ class DynamicCacheWithRepeat(DynamicCache):
         return key_states, value_states
 
     def get_seq_length(self, layer_idx=0):
-        # Handle both old and new Transformers API
-        if hasattr(self, 'key_cache') and len(self.key_cache) <= layer_idx:
+        # Use our own key_cache list for length
+        if len(self.key_cache) <= layer_idx:
             return 0
-        # For new Transformers, use the parent class method
-        if hasattr(super(), 'get_seq_length'):
-            return super().get_seq_length(layer_idx)
-        return getattr(self, '_seen_tokens', 0)
+        return self.key_cache[layer_idx].shape[-2]
 
     def clear_temp_kv_cache(self):
         if self.temp_key_cache:

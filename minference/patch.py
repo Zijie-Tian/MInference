@@ -503,6 +503,7 @@ def forward_llama_decoder_layer(
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
     past_key_value: Optional[Cache] = None,
+    past_key_values: Optional[Cache] = None,  # transformers 4.57+ uses plural form
     output_attentions: Optional[bool] = False,
     use_cache: Optional[bool] = False,
     cache_position: Optional[torch.LongTensor] = None,
@@ -512,6 +513,9 @@ def forward_llama_decoder_layer(
     chunk_size: int = 96_000,
     **kwargs,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    # Handle both singular and plural parameter names for cache
+    if past_key_value is None and past_key_values is not None:
+        past_key_value = past_key_values
     if type(hidden_states) is tuple:
         hidden_states = hidden_states[0]
         

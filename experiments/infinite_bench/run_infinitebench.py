@@ -91,8 +91,11 @@ def get_pred(
         output = outputs[0].outputs[0].text
         output = output.strip()
     else:
+        input_ids = torch.tensor(input_tokens).unsqueeze(0).to(model.device)
+        attention_mask = torch.ones_like(input_ids)
         input_tensors = {
-            "input_ids": torch.tensor(input_tokens).unsqueeze(0).to(model.device)
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
         }
         # cache = SinkCache(window_length=200000, num_sink_tokens=10000)
         # if attn_type == "minference_kv_cache_cpu":

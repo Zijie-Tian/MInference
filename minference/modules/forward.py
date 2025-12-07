@@ -8,6 +8,14 @@ from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
+# Import triton fallback for flash attention when flash_attn is unavailable
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+    _USE_TRITON_FLASH = False
+except ImportError:
+    from ..ops.flash_attn_triton import _flash_attn_triton_decoding as _flash_attn_func
+    _USE_TRITON_FLASH = True
+
 from ..modules.flexprefill import flexprefill_forward
 from ..modules.kivi import kivi_forward
 from ..modules.leank import leank_forward
@@ -133,10 +141,14 @@ def attn_forward(
 
     dropout_rate = self.attention_dropout if self.training else 0.0
 
-    if not use_cache or past_key_value is None or q_len == past_key_value.get_seq_length(
-        self.layer_idx
-    ):  # use no cache or prefilling
-        # if q_len != 1: # prefilling
+    # Determine if we're in prefill or decode mode based on sequence lengths
+    # After cache update, key_states includes cached tokens, so:
+    # - Prefill: q_len == kv_len (no cache or building initial context)
+    # - Decode: q_len < kv_len (generating with cached context)
+    kv_len = key_states.size(2)
+    is_prefill = (q_len == kv_len)
+
+    if is_prefill:  # prefilling
         if prefill_forward is not None:  # eg, a-shape/tri-shape/minference
             prefill_kwargs = {
                 "attention_mask": attention_mask,
@@ -210,17 +222,28 @@ def attn_forward(
                 1, 2
             )  # [bsz, q_len, num_heads, head_dim]
         else:
-            attn_output = _flash_attention_forward(
-                query_states.transpose(1, 2),
-                key_states.transpose(1, 2),
-                value_states.transpose(1, 2),
-                attention_mask,
-                q_len,
-                position_ids=position_ids,
-                dropout=dropout_rate,
-                sliding_window=getattr(self, "sliding_window", None),
-                is_causal=self.is_causal,
-            )
+            # Use triton fallback when flash_attn is unavailable
+            if _USE_TRITON_FLASH:
+                attn_output = _flash_attn_func(
+                    query_states.transpose(1, 2),
+                    key_states.transpose(1, 2),
+                    value_states.transpose(1, 2),
+                    dropout_p=dropout_rate,
+                    softmax_scale=None,
+                    causal=q_len != 1,  # For decode (q_len=1), no causal mask needed
+                )
+            else:
+                attn_output = _flash_attention_forward(
+                    query_states.transpose(1, 2),
+                    key_states.transpose(1, 2),
+                    value_states.transpose(1, 2),
+                    attention_mask,
+                    q_len,
+                    position_ids=position_ids,
+                    dropout=dropout_rate,
+                    sliding_window=getattr(self, "sliding_window", None),
+                    is_causal=self.is_causal,
+                )
 
     assert attn_output.size(1) == q_len
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()

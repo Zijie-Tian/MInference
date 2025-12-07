@@ -201,9 +201,16 @@ def vertical_slash_sparse_attention(
     block_size_M: int = 64,
     block_size_N: int = 64,
 ):
-    if convert_vertical_slash_indexes_opt is not None:
-        return vertical_slash_sparse_attention_wo_pad(query, key, value, v_idx, s_idx)
     batch_size, num_heads, context_size, head_dim = query.shape
+
+    # sgl_kernel's sparse_attn_func only supports headdim=128
+    # For other head dimensions, fall back to the Triton implementation
+    use_sgl_kernel = (convert_vertical_slash_indexes_opt is not None and head_dim == 128)
+
+    if use_sgl_kernel:
+        return vertical_slash_sparse_attention_wo_pad(query, key, value, v_idx, s_idx)
+
+    # Fall back to Triton implementation for unsupported head dimensions
     pad = (block_size_M - context_size) & (block_size_M - 1)
     query = torch.nn.functional.pad(query, [0, 0, 0, pad, 0, 0, 0, 0])
     key = torch.nn.functional.pad(key, [0, 0, 0, pad, 0, 0, 0, 0])
@@ -223,7 +230,9 @@ def vertical_slash_sparse_attention(
         seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
     )
 
-    if sparse_attn_func is not None:
+    # sparse_attn_func (sgl_kernel/vllm) only supports headdim=128
+    # Use Triton implementation for other head dimensions
+    if sparse_attn_func is not None and head_dim == 128:
         out = sparse_attn_func(
             query.transpose(1, 2).contiguous(),
             key.transpose(1, 2).contiguous(),
