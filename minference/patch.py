@@ -1134,7 +1134,11 @@ def minference_patch_vllm_executor(config_file: str, patch_config={}):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
-            hidden_states = self.get_input_embeddings(input_ids)
+            # vLLM V1 uses embed_tokens, V0 uses get_input_embeddings
+            if hasattr(self, 'embed_tokens'):
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -1236,20 +1240,30 @@ def minference_patch_vllm_executor(config_file: str, patch_config={}):
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self.rotary_emb(positions, q, k)
-            if "0.4.1" <= vllm_version <= "0.4.2":
+            # Parse version for proper comparison (handles 0.12 > 0.8)
+            def parse_version(v):
+                try:
+                    parts = v.split('.')
+                    return tuple(int(p) for p in parts[:2])  # Only major.minor
+                except:
+                    return (0, 0)
+
+            vllm_ver = parse_version(vllm_version)
+
+            if (0, 4, 1) <= vllm_ver + (0,) <= (0, 4, 2):
                 attn_output = self.attn(
                     q, k, v, kv_cache, attn_metadata, self.kv_scale, layer_idx
                 )
-            elif vllm_version >= "0.8.0":
+            elif vllm_ver >= (0, 8):
                 attn_output = self.attn(q, k, v, layer_idx=layer_idx)
-            elif vllm_version >= "0.4.3":
+            elif vllm_ver >= (0, 4):
                 attn_output = self.attn(
                     q, k, v, kv_cache, attn_metadata, layer_idx=layer_idx
                 )
             else:
                 assert (
                     False
-                ), "Only support 'vllm>=0.4.1'. Please update your vllm version."
+                ), f"Only support 'vllm>=0.4.1'. Got version: {vllm_version}"
 
             output, _ = self.o_proj(attn_output)
             return output

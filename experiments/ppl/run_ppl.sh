@@ -3,9 +3,9 @@
 # Licensed under The MIT License [see LICENSE for details]
 
 # Configuration - can be overridden at the command line
-MODEL_NAME=${1:-Qwen/Qwen2.5-7B-Instruct}  # Model to evaluate
+MODEL_NAME=${1:-/home/zijie/models/Llama-3-8B-Instruct-262k}  # Model to evaluate
 ATTN_TYPE=${2:-minference}                             # Attention type
-MAX_SEQ_LENGTH=${3:-100000}                           # Max sequence length
+MAX_SEQ_LENGTH=${3:-32768}                           # Max sequence length
 INTERVALS=${4:-19}                                    # Number of intervals
 NUM_EVAL_EXAMPLES=${5:-500}                           # Number of examples to evaluate
 OUTPUT_PATH=${6:-results/long-ppl/}                  # Output directory

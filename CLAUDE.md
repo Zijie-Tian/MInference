@@ -282,9 +282,34 @@ column_index = [3, 17, 45, 89]
 
 ---
 
-## 4. vLLM Integration
+## 4. Execution Environment
 
-### 4.1 API Changes in vLLM 0.9.0+
+### 4.1 Required CUDA Configuration
+
+**IMPORTANT**: All commands must be executed with the following environment variable:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1
+```
+
+**Examples:**
+```bash
+# Running InfiniteBench
+CUDA_VISIBLE_DEVICES=0,1 python run_infinitebench.py --task passkey
+
+# Running examples
+CUDA_VISIBLE_DEVICES=0,1 python examples/run_hf.py
+CUDA_VISIBLE_DEVICES=0,1 python examples/run_vllm.py
+
+# Running tests
+CUDA_VISIBLE_DEVICES=0,1 python tests/test_chat.py
+```
+
+---
+
+## 5. vLLM Integration
+
+### 5.1 API Changes in vLLM 0.9.0+
 
 | Version | API Method | Access Pattern |
 |---------|------------|----------------|
@@ -293,7 +318,7 @@ column_index = [3, 17, 45, 89]
 
 **Location**: `minference/patch.py:1294-1315`
 
-### 4.2 Required Environment Variables
+### 5.2 Required Environment Variables
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
@@ -303,7 +328,7 @@ column_index = [3, 17, 45, 89]
 
 ---
 
-## 5. Key Code Locations
+## 6. Key Code Locations
 
 | Component | File Path | Lines |
 |-----------|-----------|-------|
@@ -315,9 +340,9 @@ column_index = [3, 17, 45, 89]
 
 ---
 
-## 6. Microbenchmarks
+## 7. Microbenchmarks
 
-### 6.1 Performance Results
+### 7.1 Performance Results
 
 | Seq Length | Sparsity | Flash Attn (ms) | Sparse Attn (ms) | Speedup |
 |------------|----------|-----------------|------------------|---------|
@@ -326,7 +351,7 @@ column_index = [3, 17, 45, 89]
 | 16,384 | ~8% | 48.13 | 3.12 | 15.4x |
 | 32,768 | ~5% | 197.52 | 7.43 | 26.6x |
 
-### 6.2 Sparsity Definition
+### 7.2 Sparsity Definition
 
 ```
 Sparsity = Computed Elements / Full Causal Elements
@@ -335,7 +360,7 @@ Full Causal Elements: N × (N+1) / 2
 Sparse Elements: num_vertical × N + num_slash × block_size × N
 ```
 
-### 6.3 Running Benchmarks
+### 7.3 Running Benchmarks
 
 ```bash
 python experiments/microbench/bench_vertical_slash.py \
@@ -346,9 +371,9 @@ python experiments/microbench/bench_vertical_slash.py \
 
 ---
 
-## 7. KV Cache Quantization Integration
+## 8. KV Cache Quantization Integration
 
-### 7.1 Execution Order: Attention First, Then Quantization
+### 8.1 Execution Order: Attention First, Then Quantization
 
 **Standard Engineering Practice:**
 ```
@@ -378,7 +403,7 @@ python experiments/microbench/bench_vertical_slash.py \
 | Data Locality | K, V just computed, still in SRAM/registers |
 | Error Accumulation | Quantization error only affects decode phase |
 
-### 7.2 Mixed-Precision GEMV (FP16 × INT4)
+### 8.2 Mixed-Precision GEMV (FP16 × INT4)
 
 KIVI uses fused dequantization + GEMM instead of explicit dequantization:
 
@@ -393,7 +418,7 @@ Explicit Dequant (slow):          Fused Mixed-Precision (fast):
 Memory: 4.5x                      Memory: 0.5x
 ```
 
-### 7.3 Combining Sparse Attention + KV Quantization
+### 8.3 Combining Sparse Attention + KV Quantization
 
 | Optimization | Target | Reduction |
 |--------------|--------|-----------|
@@ -405,16 +430,16 @@ Memory: 4.5x                      Memory: 0.5x
 
 ---
 
-## 8. Prefill vs Decode Optimization
+## 9. Prefill vs Decode Optimization
 
-### 8.1 Phase Characteristics
+### 9.1 Phase Characteristics
 
 | Phase | Complexity | Bottleneck | MInference Optimization |
 |-------|-----------|------------|------------------------|
 | Prefill | O(N²) | Compute | Sparse Attention (V-S pattern) |
 | Decode | O(N) | Memory | Dense/Quest (KV cache) |
 
-### 8.2 Why Vertical-Slash is Prefill-Only
+### 9.2 Why Vertical-Slash is Prefill-Only
 
 ```
 Prefill: N×N Attention Matrix       Decode: 1×N Attention Vector
@@ -438,7 +463,7 @@ Prefill: N×N Attention Matrix       Decode: 1×N Attention Vector
 
 ---
 
-## 9. Summary
+## 10. Summary
 
 **MInference Core Innovations:**
 | Innovation | Description |
@@ -455,7 +480,7 @@ Prefill: N×N Attention Matrix       Decode: 1×N Attention Vector
 
 ---
 
-## 10. Documentation Index
+## 11. Documentation Index
 
 | Document | Content |
 |----------|---------|
