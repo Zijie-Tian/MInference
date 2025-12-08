@@ -95,7 +95,8 @@ def causal_model_forward(original_forward):
             )
             pos_ids = pos_ids.unsqueeze(0)
             kwargs["position_ids"] = pos_ids
-            kv_cache.pos_ids = pos_ids
+            if kv_cache is not None:
+                kv_cache.pos_ids = pos_ids
         return original_forward(*args, **kwargs)
 
     return new_forward
@@ -322,7 +323,7 @@ def glm_forward(
             query_layer = apply_rotary_pos_emb_glm_legacy(query_layer, rotary_pos_emb)
             key_layer = apply_rotary_pos_emb_glm_legacy(key_layer, rotary_pos_emb)
 
-        if kv_cache is not None:
+        if kv_cache is not None and hasattr(kv_cache, "update"):
             cache_kwargs = {
                 "attn_forward_config": attn_forward_config,
                 "attention_mask": attention_mask,
@@ -340,17 +341,30 @@ def glm_forward(
                 cache_kwargs,
             )
 
-        if q_len == kv_cache.get_seq_length(self.layer_number - 1):  # prefilling
+        # Determine if this is prefilling or decoding
+        kv_seq_len = kv_cache.get_seq_length(self.layer_number - 1) if hasattr(kv_cache, "get_seq_length") else q_len
+        is_prefilling = (q_len == kv_seq_len)
+
+        if is_prefilling:  # prefilling
             if prefill_forward is not None:  # eg, a-shape/tri-shape/minference
+                # Expand KV for GQA (repeat key/value heads to match query heads)
+                if num_kv_groups > 1:
+                    key_layer_expanded = key_layer.repeat_interleave(num_kv_groups, dim=1)
+                    value_layer_expanded = value_layer.repeat_interleave(num_kv_groups, dim=1)
+                else:
+                    key_layer_expanded = key_layer
+                    value_layer_expanded = value_layer
+
                 prefill_kwargs = {
                     "attention_mask": attention_mask,
                     "layer_idx": self.layer_number - 1,
                     "attn_forward_config": attn_forward_config,
+                    "num_hidden_layers": getattr(self, "num_layers", 40),  # Default to 40 for GLM-4
                 }
                 attn_output = prefill_forward(  # [bsz, num_heads, q_len, head_dim]
                     query_layer,
-                    key_layer,
-                    value_layer,
+                    key_layer_expanded,
+                    value_layer_expanded,
                     prefill_kwargs,
                 )
                 attn_output = attn_output.transpose(1, 2).contiguous()
@@ -374,7 +388,7 @@ def glm_forward(
                 decoding_kwargs = {
                     "layer_idx": self.layer_number - 1,
                     "attn_forward_config": attn_forward_config,
-                    "position_ids": kv_cache.pos_ids,
+                    "position_ids": getattr(kv_cache, "pos_ids", None),
                     "num_key_value_groups": num_kv_groups,
                 }
                 attn_output = decoding_forward(  # [bsz, num_heads, q_len, head_dim]

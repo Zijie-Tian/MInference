@@ -246,7 +246,9 @@ def visualize_layer(
     plt.tight_layout()
 
     if output_path is None:
-        output_path = os.path.join(profile_dir, f"layer_{layer_idx:02d}_blocks.png")
+        viz_dir = os.path.join(profile_dir, f"viz_bs{block_size}")
+        os.makedirs(viz_dir, exist_ok=True)
+        output_path = os.path.join(viz_dir, f"layer_{layer_idx:02d}.png")
 
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"Saved to {output_path}")
