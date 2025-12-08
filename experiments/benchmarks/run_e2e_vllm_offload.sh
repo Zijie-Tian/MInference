@@ -8,6 +8,12 @@
 #
 # This script benchmarks MInference with vLLM V1 engine and LMCache CPU offload.
 #
+# What LMCache does:
+#   - Chunk-based KV cache offloading (256 tokens per chunk)
+#   - GPU -> CPU -> Disk multi-level caching
+#   - Cross-request prefix cache reuse
+#   - Async offload without blocking inference
+#
 # Requirements:
 #   - 2 GPUs (CUDA_VISIBLE_DEVICES=0,1)
 #   - LMCache installed: pip install lmcache
@@ -23,10 +29,14 @@ set -e
 # GPU configuration
 export CUDA_VISIBLE_DEVICES=0,1
 
-# vLLM configuration
+# vLLM V1 configuration
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+
+# IMPORTANT: PYTHONHASHSEED must be set for LMCache hash consistency
+# Without this, cache hits won't work across processes
+export PYTHONHASHSEED=0
 
 # Load data (download only if not exists)
 cd "$(dirname "$0")"
@@ -43,7 +53,12 @@ echo "Configuration:"
 echo "  CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "  Model: $MODEL"
 echo "  Tensor Parallel Size: 2"
-echo "  LMCache: enabled"
+echo "  LMCache: enabled (50GB CPU memory)"
+echo ""
+echo "This benchmark tests:"
+echo "  1. Cold cache latency (first request, no cache)"
+echo "  2. Warm cache latency (same prefix, cache hit)"
+echo "  3. MInference speedup over FlashAttention-2"
 echo ""
 echo "============================================================"
 echo ""
@@ -62,5 +77,5 @@ python benchmark_e2e_vllm_offload.py \
 echo ""
 echo "============================================================"
 echo "Benchmark completed!"
-echo "Results saved to results/benchmark/vllm_offload_perf.csv"
+echo "Results saved to results/benchmark/vllm_lmcache_perf.csv"
 echo "============================================================"
