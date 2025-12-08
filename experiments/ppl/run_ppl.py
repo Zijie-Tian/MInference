@@ -36,7 +36,7 @@ class LongPPL:
         kv_type: str = "dense",
         **kwargs,
     ) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.prepare_data(
             data_path,
             min_context,
@@ -74,10 +74,11 @@ class LongPPL:
                 starting_layer=topk_from_layer,
                 kv_type=kv_type,
             )
-            self.model = LlamaForCausalLM.from_pretrained(
+            self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype="auto",
                 device_map="auto",
+                trust_remote_code=True,
             )
             self.model.config.is_ppl = True
             self.model = minference_patch(self.model)
@@ -92,7 +93,13 @@ class LongPPL:
         num_eval_examples: int,
     ):
         def tok(x):
-            return self.tokenizer(x["text"])
+            # Use convert_tokens_to_ids to avoid padding issues with some tokenizers (e.g., ChatGLM4)
+            tokens = self.tokenizer.tokenize(x["text"])
+            input_ids = self.tokenizer.convert_tokens_to_ids(tokens)
+            return {
+                "input_ids": input_ids,
+                "attention_mask": [1] * len(input_ids),
+            }
 
         def truncate(x, length=None):
             return {
@@ -140,27 +147,38 @@ class LongPPL:
         loss = -prob[torch.arange(prob.size(0)), shift_labels].mean()
         return loss.exp().item()
 
-    def chunk_ppl(self, logits, labels, chunk_size=10000):
-        total_loss = 0
-        num_chunks = 0
-        for i in range(0, logits.size(1), chunk_size):
-            chunk_logits = logits[:, i : i + chunk_size][..., :-1, :].contiguous()
-            chunk_labels = labels[:, i : i + chunk_size][..., 1:].contiguous()
+    def chunk_ppl(self, logits, labels, chunk_size=2048):
+        total_loss = 0.0
+        total_tokens = 0
+        seq_len = logits.size(1)
 
-            chunk_prob = F.log_softmax(chunk_logits, dim=-1, dtype=torch.float32).to(
-                logits.dtype
-            )
-            chunk_labels = chunk_labels.view(-1)
-            chunk_prob = chunk_prob.view(-1, chunk_prob.size(-1))
+        for i in range(0, seq_len - 1, chunk_size):
+            end = min(i + chunk_size, seq_len - 1)
+            chunk_logits = logits[:, i:end, :].contiguous()
+            chunk_labels = labels[:, i + 1:end + 1].contiguous()
 
-            chunk_loss = -chunk_prob[
-                torch.arange(chunk_prob.size(0)), chunk_labels
-            ].sum()
+            # Compute log softmax in smaller pieces to save memory
+            chunk_prob = F.log_softmax(chunk_logits, dim=-1, dtype=torch.float32)
+
+            # Gather the log probs for the target tokens
+            chunk_labels_flat = chunk_labels.view(-1)
+            chunk_prob_flat = chunk_prob.view(-1, chunk_prob.size(-1))
+
+            target_log_probs = chunk_prob_flat[
+                torch.arange(chunk_prob_flat.size(0), device=chunk_prob_flat.device),
+                chunk_labels_flat
+            ]
+
+            chunk_loss = -target_log_probs.sum().item()
             total_loss += chunk_loss
-            num_chunks += 1
+            total_tokens += chunk_labels_flat.size(0)
 
-        total_loss /= logits.size(1) - num_chunks
-        return total_loss.exp().item()
+            # Clean up
+            del chunk_logits, chunk_labels, chunk_prob, chunk_prob_flat, target_log_probs
+            torch.cuda.empty_cache()
+
+        avg_loss = total_loss / total_tokens
+        return np.exp(avg_loss)
 
     def start_test(self):
         print("Starting test...")
