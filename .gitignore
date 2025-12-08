@@ -415,6 +415,7 @@ build/
 *.egg-info/
 *.so
 *.csv
+*.png
 dist
 prompt_hardest.txt
 tools/profiles
