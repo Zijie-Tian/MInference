@@ -10,3 +10,7 @@
 	path = 3rdparty/flash-attention
 	url = https://github.com/Dao-AILab/flash-attention.git
 	branch = tzj/minference
+[submodule "3rdparty/nano-vllm"]
+	path = 3rdparty/nano-vllm
+	url = https://github.com/Zijie-Tian/nano-vllm.git
+	branch = tzj/minference
