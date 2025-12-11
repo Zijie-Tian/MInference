@@ -14,3 +14,7 @@
 	path = 3rdparty/nano-vllm
 	url = https://github.com/Zijie-Tian/nano-vllm.git
 	branch = tzj/minference
+[submodule "3rdparty/flashinfer"]
+	path = 3rdparty/flashinfer
+	url = https://github.com/Zijie-Tian/flashinfer.git
+	branch = tzj/minference
