@@ -11,7 +11,20 @@ import warnings
 import torch
 from packaging.version import parse
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension, CppExtension
+
+# Check for AVX-512 support
+def check_avx512_support():
+    """Check if the CPU supports AVX-512."""
+    import subprocess
+    try:
+        result = subprocess.run(['grep', '-q', 'avx512', '/proc/cpuinfo'],
+                                capture_output=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+HAS_AVX512 = check_avx512_support() if platform.system() == 'Linux' else False
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 # PEP0440 compatible formatted version, see:
@@ -106,6 +119,38 @@ if not SKIP_CUDA_BUILD:
             extra_compile_args=["-std=c++17", "-O3"],
         )
     )
+
+# CPU Sparse Attention Extension (AVX-512)
+# This is separate from CUDA and can be built without CUDA
+SKIP_CPU_BUILD = os.getenv("MINFERENCE_SKIP_CPU_BUILD", "FALSE") == "TRUE"
+
+if not SKIP_CPU_BUILD and HAS_AVX512:
+    print("\n\nBuilding CPU sparse attention extension with AVX-512...\n\n")
+    cpu_extra_compile_args = [
+        "-std=c++17",
+        "-O3",
+        "-mavx512f",
+        "-mavx512dq",
+        "-mavx512vl",
+        "-mavx512bw",
+        "-fopenmp",
+        "-ffast-math",
+    ]
+    cpu_extra_link_args = ["-fopenmp"]
+
+    ext_modules.append(
+        CppExtension(
+            name="minference._C.cpu_sparse_attention",
+            sources=[
+                os.path.join("csrc", "cpu", "sparse_attention.cpp"),
+            ],
+            extra_compile_args=cpu_extra_compile_args,
+            extra_link_args=cpu_extra_link_args,
+            include_dirs=[os.path.join(this_dir, "csrc", "cpu")],
+        )
+    )
+elif not SKIP_CPU_BUILD:
+    print("\n\nSkipping CPU sparse attention extension (AVX-512 not available)\n\n")
 
 
 def get_minference_version() -> str:
