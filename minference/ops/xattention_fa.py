@@ -298,9 +298,19 @@ def flat_group_gemm(query_states, key_states, chunk_start, chunk_end):
     kv_len = key_states.shape[2]
 
     output = torch.empty((batch_size, num_heads, q_len, kv_len), dtype=query_states.dtype, device=query_states.device)
-    BLOCK_M = 128
-    BLOCK_N = 128
-    BLOCK_K = 64
+
+    # Check GPU type and adjust block sizes accordingly
+    # RTX 3090/4090 have limited shared memory compared to A100/H100
+    gpu_name = torch.cuda.get_device_properties(torch.cuda.current_device()).name
+    # Use smaller block size for consumer GPUs with limited shared memory
+    if any(gpu in gpu_name for gpu in ["3090", "4090", "4080", "3080", "3070"]):
+        BLOCK_M = 64
+        BLOCK_N = 64
+        BLOCK_K = 64
+    else:
+        BLOCK_M = 128
+        BLOCK_N = 128
+        BLOCK_K = 64
 
     grid = (q_len // BLOCK_M, kv_len // BLOCK_N, batch_size * num_heads)
     flat_group_gemm_kernel[grid](
@@ -336,8 +346,17 @@ def flat_group_gemm_fuse_reshape(query_states, key_states, stride, chunk_start, 
     assert (key_states.shape[3] == head_dim)
 
     output = torch.empty((batch_size, num_heads, q_len // stride, kv_len // stride), dtype=query_states.dtype, device=query_states.device)
-    BLOCK_M = 128
-    BLOCK_N = 128
+
+    # Check GPU type and adjust block sizes accordingly
+    # RTX 3090/4090 have limited shared memory compared to A100/H100
+    gpu_name = torch.cuda.get_device_properties(torch.cuda.current_device()).name
+    # Use smaller block size for consumer GPUs with limited shared memory
+    if any(gpu in gpu_name for gpu in ["3090", "4090", "4080", "3080", "3070"]):
+        BLOCK_M = 64
+        BLOCK_N = 64
+    else:
+        BLOCK_M = 128
+        BLOCK_N = 128
     assert (q_len % (stride * BLOCK_M) == 0)
     assert (kv_len % (stride * BLOCK_N) == 0)
 

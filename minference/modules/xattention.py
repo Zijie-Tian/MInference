@@ -219,12 +219,13 @@ def xattn_estimate(
     attn_sum_list = []
     simple_mask_list = []
 
-    if use_triton and (
-        "100" not in torch.cuda.get_device_properties(torch.cuda.current_device()).name
-    ):
+    # Check if GPU supports Triton kernel (A100, RTX 3090, RTX 4090, etc.)
+    gpu_name = torch.cuda.get_device_properties(torch.cuda.current_device()).name
+    supported_gpus = ["100", "3090", "4090", "4080", "H100", "H200"]
+    if use_triton and not any(gpu in gpu_name for gpu in supported_gpus):
         use_triton = False
         print(
-            "setting use triton to false. Triton kernel not surpported on this device"
+            f"setting use triton to false. Triton kernel not supported on {gpu_name}"
         )
 
     reshaped_chunk_size = chunk_size // stride

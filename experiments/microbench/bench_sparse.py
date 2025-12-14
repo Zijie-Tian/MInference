@@ -13,13 +13,19 @@ from minference.modules.minference_forward import search_pattern_v2, minference_
 from minference.modules.flexprefill import flex_prefill_attention
 
 try:
+    from minference.modules.xattention import Xattention_prefill
+    HAS_XATTENTION = True
+except ImportError:
+    HAS_XATTENTION = False
+
+try:
     from flash_attn import flash_attn_func
 except ImportError:
     from minference.ops.flash_attn_triton import _flash_attn_triton_decoding as flash_attn_func
 
 # Configuration
 MODEL_PATH = "/home/zijie/models/Qwen3-0.6B/"
-SEQ_LEN = 4096
+SEQ_LEN = 16384
 LAYER_TO_SAVE = 0
 CHUNK_SIZE = 2048
 SAVE_DIR = "results/kvcache"
@@ -125,11 +131,17 @@ if __name__ == "__main__":
 
     # FlexPrefill parameters
     GAMMA = 0.9
-    TAU = 0.1
+    TAU = 0.5
     BLOCK_SIZE = 32
+
+    # XAttention parameters (block_size must be 128 for block_sparse_attn_func)
+    XATTN_STRIDE = 8
+    XATTN_THRESHOLD = 0.9
+    XATTN_BLOCK_SIZE = 128
 
     print(f"\nConfig: seq_len={SEQ_LEN}, num_heads={num_heads}, warmup={WARMUP}, repeat={REPEAT}")
     print(f"FlexPrefill: gamma={GAMMA}, tau={TAU}, block_size={BLOCK_SIZE}")
+    print(f"XAttention: stride={XATTN_STRIDE}, threshold={XATTN_THRESHOLD}, block_size={XATTN_BLOCK_SIZE}")
 
     # Benchmark Flash Attention (all heads)
     flash_time, flash_std = benchmark_kernel(
@@ -152,12 +164,31 @@ if __name__ == "__main__":
         warmup=WARMUP, repeat=REPEAT
     )
 
+    # Benchmark XAttention (all heads) - input shape: [batch, heads, seq, dim]
+    if HAS_XATTENTION:
+        try:
+            xattn_time, xattn_std = benchmark_kernel(
+                Xattention_prefill,
+                q, k, v, XATTN_STRIDE,
+                norm=1, threshold=XATTN_THRESHOLD, block_size=XATTN_BLOCK_SIZE,
+                warmup=WARMUP, repeat=REPEAT
+            )
+        except Exception as e:
+            print(f"XAttention error: {e}")
+            xattn_time, xattn_std = float('inf'), 0
+    else:
+        xattn_time, xattn_std = float('inf'), 0
+
     # Print results
     print(f"\n{'Method':<20} {'Time (ms)':<20} {'vs Flash'}")
     print("-" * 55)
     print(f"{'Flash Attention':<20} {flash_time:.3f} ± {flash_std:.3f}         1.00x")
     print(f"{'MInference':<20} {minference_time:.3f} ± {minference_std:.3f}         {flash_time/minference_time:.2f}x")
     print(f"{'FlexPrefill':<20} {flexprefill_time:.3f} ± {flexprefill_std:.3f}         {flash_time/flexprefill_time:.2f}x")
+    if HAS_XATTENTION and xattn_time != float('inf'):
+        print(f"{'XAttention':<20} {xattn_time:.3f} ± {xattn_std:.3f}         {flash_time/xattn_time:.2f}x")
+    else:
+        print(f"{'XAttention':<20} {'N/A (requires block_sparse_attn)'}")
 
     # ============================================================================
     # Section 3: Save KV cache
