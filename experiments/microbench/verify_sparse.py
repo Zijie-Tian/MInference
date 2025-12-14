@@ -2,25 +2,25 @@
 # Licensed under The MIT License [see LICENSE for details]
 
 """
-Microbenchmark: Vertical-Slash Sparse Attention vs Flash Attention
+Correctness Verification: Vertical-Slash Sparse Attention
 
-This benchmark compares the performance of MInference's Vertical-Slash sparse
-attention kernel against standard Flash Attention across different sequence
-lengths and sparsity levels.
+This script verifies the numerical correctness of MInference's Vertical-Slash
+sparse attention kernel by comparing its output against dense Flash Attention.
 
 Usage:
-    python experiments/microbench/bench_vertical_slash.py
-    python experiments/microbench/bench_vertical_slash.py --seq_lens 4096 8192 16384
-    python experiments/microbench/bench_vertical_slash.py --sparsity 0.01 0.05 0.1
+    python experiments/microbench/verify_sparse.py
+    python experiments/microbench/verify_sparse.py --seq_lens 1024 2048 4096
+    python experiments/microbench/verify_sparse.py --verbose
 """
 
 import argparse
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import torch
 import triton
 import triton.language as tl
+
 
 # ============================================================================
 # Triton Kernels (copied from minference/ops for standalone execution)
@@ -368,7 +368,7 @@ def prepare_sparse_indices(
     block_size_M: int = 64,
     block_size_N: int = 64,
 ):
-    """Pre-compute sparse indices (do this outside the benchmark loop)."""
+    """Pre-compute sparse indices."""
     pad = (block_size_M - context_size % block_size_M) % block_size_M
     padded_size = context_size + pad
 
@@ -393,16 +393,18 @@ def prepare_sparse_indices(
     }
 
 
-def vertical_slash_sparse_attention_with_indices(
+def vertical_slash_sparse_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    indices: dict,
+    v_idx: torch.Tensor,
+    s_idx: torch.Tensor,
     block_size_M: int = 64,
     block_size_N: int = 64,
-):
-    """Sparse attention with pre-computed indices (for benchmarking kernel only)."""
+) -> torch.Tensor:
+    """Vertical-Slash sparse attention."""
     batch_size, num_heads, context_size, head_dim = query.shape
+    indices = prepare_sparse_indices(batch_size, num_heads, context_size, v_idx, s_idx, block_size_M, block_size_N)
     pad = indices['pad']
 
     if pad > 0:
@@ -423,7 +425,7 @@ def vertical_slash_sparse_attention_with_indices(
 
 
 # ============================================================================
-# Benchmarking Functions
+# Verification Functions
 # ============================================================================
 
 def generate_sparse_pattern(
@@ -434,7 +436,7 @@ def generate_sparse_pattern(
     num_slash: int,
     device: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate synthetic sparse patterns for benchmarking."""
+    """Generate synthetic sparse patterns for testing."""
     v_idx = torch.randint(0, seq_len // 2, (batch_size, num_heads, num_vertical),
                           device=device, dtype=torch.int32)
     s_idx = torch.randint(0, seq_len, (batch_size, num_heads, num_slash),
@@ -442,159 +444,205 @@ def generate_sparse_pattern(
     return v_idx, s_idx
 
 
-def benchmark_kernel(func, *args, warmup=10, repeat=100, **kwargs):
-    """Benchmark a kernel function."""
-    for _ in range(warmup):
-        _ = func(*args, **kwargs)
-    torch.cuda.synchronize()
+def compute_metrics(sparse_out: torch.Tensor, dense_out: torch.Tensor) -> Dict[str, float]:
+    """Compute various error metrics between sparse and dense outputs."""
+    # Flatten for easier computation
+    sparse_flat = sparse_out.float().flatten()
+    dense_flat = dense_out.float().flatten()
 
-    times = []
-    for _ in range(repeat):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        _ = func(*args, **kwargs)
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
+    # Absolute error
+    abs_error = (sparse_flat - dense_flat).abs()
+    max_abs_error = abs_error.max().item()
+    mean_abs_error = abs_error.mean().item()
 
-    times = torch.tensor(times)
-    return times.mean().item(), times.std().item()
+    # Relative error (avoid division by zero)
+    rel_error = abs_error / (dense_flat.abs() + 1e-8)
+    max_rel_error = rel_error.max().item()
+    mean_rel_error = rel_error.mean().item()
+
+    # Cosine similarity
+    cosine_sim = torch.nn.functional.cosine_similarity(
+        sparse_flat.unsqueeze(0), dense_flat.unsqueeze(0)
+    ).item()
+
+    # Check for NaN/Inf
+    has_nan = torch.isnan(sparse_out).any().item()
+    has_inf = torch.isinf(sparse_out).any().item()
+
+    return {
+        'max_abs_error': max_abs_error,
+        'mean_abs_error': mean_abs_error,
+        'max_rel_error': max_rel_error,
+        'mean_rel_error': mean_rel_error,
+        'cosine_similarity': cosine_sim,
+        'has_nan': has_nan,
+        'has_inf': has_inf,
+    }
 
 
-def run_benchmark(
+def verify_single_config(
+    seq_len: int,
+    batch_size: int = 1,
+    num_heads: int = 4,
+    head_dim: int = 128,
+    num_vertical: int = 64,
+    num_slash: int = 32,
+    dtype: torch.dtype = torch.bfloat16,
+    verbose: bool = False,
+) -> Dict:
+    """Verify correctness for a single configuration."""
+    device = "cuda"
+
+    # Generate inputs
+    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+
+    # Generate sparse pattern
+    v_idx, s_idx = generate_sparse_pattern(batch_size, num_heads, seq_len, num_vertical, num_slash, device)
+
+    # Compute outputs
+    sparse_out = vertical_slash_sparse_attention(q, k, v, v_idx, s_idx)
+    dense_out = flash_attention_reference(q, k, v)
+
+    # Compute metrics
+    metrics = compute_metrics(sparse_out, dense_out)
+
+    result = {
+        'seq_len': seq_len,
+        'batch_size': batch_size,
+        'num_heads': num_heads,
+        'head_dim': head_dim,
+        'num_vertical': num_vertical,
+        'num_slash': num_slash,
+        'dtype': str(dtype),
+        **metrics,
+    }
+
+    if verbose:
+        print(f"\n  Config: seq_len={seq_len}, batch={batch_size}, heads={num_heads}, "
+              f"head_dim={head_dim}")
+        print(f"  Sparse pattern: num_vertical={num_vertical}, num_slash={num_slash}")
+        print(f"  Output shape: {sparse_out.shape}")
+        print(f"  Max absolute error: {metrics['max_abs_error']:.6e}")
+        print(f"  Mean absolute error: {metrics['mean_abs_error']:.6e}")
+        print(f"  Max relative error: {metrics['max_rel_error']:.6e}")
+        print(f"  Mean relative error: {metrics['mean_rel_error']:.6e}")
+        print(f"  Cosine similarity: {metrics['cosine_similarity']:.8f}")
+        print(f"  Has NaN: {metrics['has_nan']}, Has Inf: {metrics['has_inf']}")
+
+    return result
+
+
+def run_verification(
     seq_lens: List[int],
     batch_size: int = 1,
-    num_heads: int = 32,
+    num_heads: int = 4,
     head_dim: int = 128,
-    sparsity_ratios: List[float] = [0.01, 0.05, 0.1],
-    warmup: int = 10,
-    repeat: int = 100,
+    sparsity_ratios: List[float] = [0.05, 0.1],
     dtype: torch.dtype = torch.bfloat16,
+    verbose: bool = False,
 ):
-    """Run comprehensive benchmark."""
-    print("=" * 80)
-    print("Vertical-Slash Sparse Attention vs Flash Attention Benchmark")
-    print("=" * 80)
+    """Run comprehensive verification across multiple configurations."""
+    print("=" * 70)
+    print("Vertical-Slash Sparse Attention Correctness Verification")
+    print("=" * 70)
     print(f"Config: batch={batch_size}, heads={num_heads}, head_dim={head_dim}")
-    print(f"Warmup: {warmup}, Repeat: {repeat}, Dtype: {dtype}")
+    print(f"Dtype: {dtype}")
     print(f"Flash Attention backend: {'flash_attn' if HAS_FLASH_ATTN else 'triton'}")
-    print("=" * 80)
+    print("=" * 70)
 
     results = []
+    all_passed = True
 
     for seq_len in seq_lens:
-        print(f"\n{'='*60}")
+        print(f"\n{'='*50}")
         print(f"Sequence Length: {seq_len:,}")
-        print(f"{'='*60}")
+        print(f"{'='*50}")
 
-        q = torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=dtype)
-        k = torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=dtype)
-        v = torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=dtype)
-
-        # Benchmark Flash Attention
-        print("\n[Flash Attention (Dense Causal)]")
-        try:
-            fa_time, fa_std = benchmark_kernel(flash_attention_reference, q, k, v, warmup=warmup, repeat=repeat)
-            print(f"  Time: {fa_time:.3f} ± {fa_std:.3f} ms")
-            flops_dense = 2 * batch_size * num_heads * seq_len * seq_len * head_dim
-            tflops_dense = flops_dense / (fa_time / 1000) / 1e12
-            print(f"  Throughput: {tflops_dense:.2f} TFLOPS")
-        except Exception as e:
-            print(f"  Error: {e}")
-            fa_time = float('inf')
-
-        # Benchmark Vertical-Slash
         for sparsity in sparsity_ratios:
             block_size = 64
-            # For long sequences, use realistic sparse counts
-            # num_vertical: important tokens (like BOS, keywords)
-            # num_slash: number of diagonal blocks to include
             num_vertical = max(32, min(512, int(seq_len * sparsity * 0.5)))
             num_slash = max(8, min(128, int(seq_len * sparsity * 0.5 / block_size)))
 
-            # Effective sparsity: what fraction of the full attention we compute
-            # For causal attention: full = seq_len * seq_len / 2
-            # Sparse = num_vertical * seq_len + num_slash * block_size * seq_len / num_rows
-            full_attention_elements = seq_len * (seq_len + 1) // 2
-            sparse_elements = num_vertical * seq_len + num_slash * block_size * seq_len
-            effective_sparsity = min(1.0, sparse_elements / full_attention_elements)
+            print(f"\n[Sparsity ~{sparsity:.0%}] num_vertical={num_vertical}, num_slash={num_slash}")
 
-            print(f"\n[Vertical-Slash Sparse (sparsity≈{effective_sparsity:.1%})]")
-            print(f"  num_vertical={num_vertical}, num_slash={num_slash}")
+            result = verify_single_config(
+                seq_len=seq_len,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                num_vertical=num_vertical,
+                num_slash=num_slash,
+                dtype=dtype,
+                verbose=verbose,
+            )
+            results.append(result)
 
-            v_idx, s_idx = generate_sparse_pattern(batch_size, num_heads, seq_len, num_vertical, num_slash)
+            # Check if test passed
+            passed = (
+                not result['has_nan'] and
+                not result['has_inf'] and
+                result['cosine_similarity'] > 0.99
+            )
 
-            try:
-                # Pre-compute indices (not part of kernel benchmark)
-                print("  Pre-computing indices...")
-                indices = prepare_sparse_indices(batch_size, num_heads, seq_len, v_idx, s_idx)
-                print("  Indices ready. Benchmarking kernel...")
+            if passed:
+                print(f"  Status: PASSED (cosine_sim={result['cosine_similarity']:.6f})")
+            else:
+                print(f"  Status: FAILED")
+                print(f"    - Has NaN: {result['has_nan']}")
+                print(f"    - Has Inf: {result['has_inf']}")
+                print(f"    - Cosine similarity: {result['cosine_similarity']:.6f}")
+                all_passed = False
 
-                vs_time, vs_std = benchmark_kernel(
-                    vertical_slash_sparse_attention_with_indices,
-                    q, k, v, indices,
-                    warmup=warmup, repeat=repeat
-                )
-                print(f"  Time: {vs_time:.3f} ± {vs_std:.3f} ms")
+    # Summary
+    print("\n" + "=" * 70)
+    print("VERIFICATION SUMMARY")
+    print("=" * 70)
+    print(f"{'Seq Len':>10} | {'Sparsity':>10} | {'Max Abs Err':>12} | {'Cosine Sim':>12} | {'Status':>8}")
+    print("-" * 70)
 
-                speedup = fa_time / vs_time
-                print(f"  Speedup vs Flash Attention: {speedup:.2f}x")
-
-                theoretical_speedup = 1 / effective_sparsity
-                efficiency = speedup / theoretical_speedup * 100
-                print(f"  Theoretical max speedup: {theoretical_speedup:.2f}x")
-                print(f"  Efficiency: {efficiency:.1f}%")
-
-                results.append({
-                    'seq_len': seq_len,
-                    'sparsity': effective_sparsity,
-                    'fa_time': fa_time,
-                    'vs_time': vs_time,
-                    'speedup': speedup,
-                    'efficiency': efficiency,
-                })
-            except Exception as e:
-                print(f"  Error: {e}")
-                import traceback
-                traceback.print_exc()
-
-    # Summary table
-    print("\n" + "=" * 80)
-    print("SUMMARY TABLE")
-    print("=" * 80)
-    print(f"{'Seq Len':>10} | {'Sparsity':>10} | {'FA (ms)':>10} | {'VS (ms)':>10} | {'Speedup':>10} | {'Efficiency':>10}")
-    print("-" * 80)
     for r in results:
-        print(f"{r['seq_len']:>10,} | {r['sparsity']:>10.1%} | {r['fa_time']:>10.3f} | {r['vs_time']:>10.3f} | {r['speedup']:>10.2f}x | {r['efficiency']:>9.1f}%")
+        sparsity = r['num_vertical'] * r['seq_len'] / (r['seq_len'] * (r['seq_len'] + 1) // 2)
+        passed = not r['has_nan'] and not r['has_inf'] and r['cosine_similarity'] > 0.99
+        status = "PASS" if passed else "FAIL"
+        print(f"{r['seq_len']:>10,} | {sparsity:>10.2%} | {r['max_abs_error']:>12.2e} | "
+              f"{r['cosine_similarity']:>12.8f} | {status:>8}")
 
-    return results
+    print("-" * 70)
+    if all_passed:
+        print("Overall: ALL TESTS PASSED")
+    else:
+        print("Overall: SOME TESTS FAILED")
+
+    return results, all_passed
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark Vertical-Slash vs Flash Attention")
-    parser.add_argument("--seq_lens", type=int, nargs="+", default=[1024, 2048, 4096])
-    parser.add_argument("--sparsity", type=float, nargs="+", default=[0.01, 0.05, 0.1])
+    parser = argparse.ArgumentParser(description="Verify Vertical-Slash Sparse Attention Correctness")
+    parser.add_argument("--seq_lens", type=int, nargs="+", default=[512, 1024, 2048, 4096])
+    parser.add_argument("--sparsity", type=float, nargs="+", default=[0.05, 0.1])
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_heads", type=int, default=32)
+    parser.add_argument("--num_heads", type=int, default=4)
     parser.add_argument("--head_dim", type=int, default=128)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
+    parser.add_argument("--verbose", action="store_true", help="Print detailed metrics")
 
     args = parser.parse_args()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
-    run_benchmark(
+    results, all_passed = run_verification(
         seq_lens=args.seq_lens,
         batch_size=args.batch_size,
         num_heads=args.num_heads,
         head_dim=args.head_dim,
         sparsity_ratios=args.sparsity,
-        warmup=args.warmup,
-        repeat=args.repeat,
         dtype=dtype,
+        verbose=args.verbose,
     )
+
+    # Exit with non-zero code if tests failed
+    exit(0 if all_passed else 1)
 
 
 if __name__ == "__main__":
