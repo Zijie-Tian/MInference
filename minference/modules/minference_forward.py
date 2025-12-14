@@ -1810,3 +1810,258 @@ def minference_vllm_forward(
         return forward_vllm_080
     else:  # >= 0.12.0 (V1 engine)
         return forward_vllm_v1
+
+
+# ============================================================================
+# KV Cache Saving Forward Functions
+# ============================================================================
+
+def minference_forward_to_save():
+    """
+    Forward function that saves KV cache to disk for microbenchmarking.
+
+    This function wraps the standard minference forward and adds the ability
+    to save query and key states to pickle files for offline analysis.
+
+    Usage:
+        1. Load model with this forward function
+        2. Set layer_to_save and target_len on each attention layer
+        3. Run inference - Q/K will be saved to output directory
+
+    Attributes set on self (attention layer):
+        - layer_to_save (int): Which layer's Q/K to save
+        - target_len (int): Expected sequence length
+        - save_dir (str): Directory to save files (default: "output")
+    """
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_value,
+        output_attentions,
+        use_cache,
+        **kwargs,
+    ):
+        import pickle
+
+        self.init_minference_parameters()
+        self.ne_inf = torch.finfo(hidden_states.dtype).min
+
+        bsz, q_len, _ = hidden_states.size()
+
+        if "q_proj" in self.__dict__["_modules"]:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+        else:
+            qkv = self.qkv_proj(hidden_states)
+            query_pos = self.num_heads * self.head_dim
+            key_value_pos = query_pos // self.num_key_value_groups
+            query_states, key_states, value_states = torch.split(qkv, [query_pos, key_value_pos, key_value_pos], -1)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
+        set_rope_type(self)
+        cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
+        if ROPE_TYPE == "max_seq_len":
+            if cos.device != query_states.device:
+                cos = cos.to(query_states.device)
+            query_states = apply_rotary_pos_emb(query_states, cos)
+            key_states = apply_rotary_pos_emb(key_states, cos)
+        else:
+            if position_ids is not None and position_ids.device != cos.device:
+                position_ids = position_ids.to(cos.device)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states_expanded = repeat_kv(key_states, self.num_key_value_groups)
+        value_states_expanded = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Save KV cache if this is the target layer
+        if hasattr(self, 'layer_to_save') and self.layer_idx == self.layer_to_save:
+            save_dir = getattr(self, 'save_dir', 'results/kvcache')
+            target_len = getattr(self, 'target_len', kv_seq_len)
+            os.makedirs(save_dir, exist_ok=True)
+
+            query_path = os.path.join(save_dir, f"query_{target_len}.pkl")
+            key_path = os.path.join(save_dir, f"key_{target_len}.pkl")
+            value_path = os.path.join(save_dir, f"value_{target_len}.pkl")
+
+            # Save query states (accumulate across chunks)
+            if os.path.exists(query_path) and os.path.getsize(query_path) > 0:
+                with open(query_path, "rb") as f:
+                    loaded_query = pickle.load(f)
+                with open(query_path, "wb") as f:
+                    pickle.dump(torch.cat([loaded_query, query_states], dim=-2), f)
+                del loaded_query
+            else:
+                with open(query_path, "wb") as f:
+                    pickle.dump(query_states, f)
+
+            # Save key and value states (only when full sequence is available)
+            if key_states_expanded.shape[-2] == target_len:
+                with open(key_path, "wb") as f:
+                    pickle.dump(key_states_expanded, f)
+                with open(value_path, "wb") as f:
+                    pickle.dump(value_states_expanded, f)
+
+        # Standard attention computation
+        if q_len != 1:
+            output = torch.empty_like(query_states)
+            for head in range(query_states.size(1)):
+                q = query_states[:, head, :, :].unsqueeze(1)
+                k = key_states_expanded[:, head, :, :].unsqueeze(1)
+                v = value_states_expanded[:, head, :, :].unsqueeze(1)
+                if self.layer_idx >= self.starting_layer:
+                    attn_output = self.gather_last_q_vertical_slash_topk_v4(q, k, v, head)
+                elif is_flash_attn_2_available():
+                    attn_output = flash_attn_func(
+                        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                        0.0, softmax_scale=None, causal=q_len != 1
+                    ).view(bsz, 1, q_len, self.head_dim)
+                else:
+                    attn_output = gather_qkv(q, k, v, attention_mask)
+                output[:, head:head + 1] = attn_output
+        else:
+            output = flash_attn_func(
+                query_states.transpose(1, 2),
+                key_states_expanded.transpose(1, 2),
+                value_states_expanded.transpose(1, 2),
+                0.0, softmax_scale=None, causal=q_len != 1
+            ).view(bsz, query_states.size(1), q_len, self.head_dim)
+
+        attn_output = output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+    return forward
+
+
+def minference_dense_forward_to_save():
+    """
+    Dense attention forward function that saves KV cache to disk.
+
+    This version uses standard dense attention (flash attention) instead of
+    sparse attention, suitable for collecting ground truth data.
+    """
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        position_ids,
+        past_key_value,
+        output_attentions,
+        use_cache,
+        **kwargs,
+    ):
+        import pickle
+
+        self.init_minference_parameters()
+        self.ne_inf = torch.finfo(hidden_states.dtype).min
+
+        bsz, q_len, _ = hidden_states.size()
+
+        if "q_proj" in self.__dict__["_modules"]:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+        else:
+            qkv = self.qkv_proj(hidden_states)
+            query_pos = self.num_heads * self.head_dim
+            key_value_pos = query_pos // self.num_key_value_groups
+            query_states, key_states, value_states = torch.split(qkv, [query_pos, key_value_pos, key_value_pos], -1)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
+        set_rope_type(self)
+        cos, sin = get_cos_sin(self, value_states, kv_seq_len, position_ids)
+        if ROPE_TYPE == "max_seq_len":
+            if cos.device != query_states.device:
+                cos = cos.to(query_states.device)
+            query_states = apply_rotary_pos_emb(query_states, cos)
+            key_states = apply_rotary_pos_emb(key_states, cos)
+        else:
+            if position_ids is not None and position_ids.device != cos.device:
+                position_ids = position_ids.to(cos.device)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states_expanded = repeat_kv(key_states, self.num_key_value_groups)
+        value_states_expanded = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Save KV cache if this is the target layer
+        if hasattr(self, 'layer_to_save') and self.layer_idx == self.layer_to_save:
+            save_dir = getattr(self, 'save_dir', 'results/kvcache')
+            target_len = getattr(self, 'target_len', kv_seq_len)
+            os.makedirs(save_dir, exist_ok=True)
+
+            query_path = os.path.join(save_dir, f"query_{target_len}.pkl")
+            key_path = os.path.join(save_dir, f"key_{target_len}.pkl")
+            value_path = os.path.join(save_dir, f"value_{target_len}.pkl")
+
+            # Save query states (accumulate across chunks)
+            if os.path.exists(query_path) and os.path.getsize(query_path) > 0:
+                with open(query_path, "rb") as f:
+                    loaded_query = pickle.load(f)
+                with open(query_path, "wb") as f:
+                    pickle.dump(torch.cat([loaded_query, query_states], dim=-2), f)
+                del loaded_query
+            else:
+                with open(query_path, "wb") as f:
+                    pickle.dump(query_states, f)
+
+            # Save key and value states (only when full sequence is available)
+            if key_states_expanded.shape[-2] == target_len:
+                with open(key_path, "wb") as f:
+                    pickle.dump(key_states_expanded, f)
+                with open(value_path, "wb") as f:
+                    pickle.dump(value_states_expanded, f)
+
+        # Dense attention using flash attention
+        output = flash_attn_func(
+            query_states.transpose(1, 2),
+            key_states_expanded.transpose(1, 2),
+            value_states_expanded.transpose(1, 2),
+            0.0, softmax_scale=None, causal=q_len != 1
+        ).view(bsz, query_states.size(1), q_len, self.head_dim)
+
+        attn_output = output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+    return forward
