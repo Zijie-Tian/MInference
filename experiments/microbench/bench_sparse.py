@@ -25,7 +25,7 @@ except ImportError:
 
 # Configuration
 MODEL_PATH = "/home/zijie/models/Qwen3-0.6B/"
-SEQ_LEN = 16384
+SEQ_LEN = 16384 * 2
 LAYER_TO_SAVE = 0
 CHUNK_SIZE = 2048
 SAVE_DIR = "results/kvcache"
@@ -135,7 +135,7 @@ if __name__ == "__main__":
     BLOCK_SIZE = 32
 
     # XAttention parameters (block_size must be 128 for block_sparse_attn_func)
-    XATTN_STRIDE = 8
+    XATTN_STRIDE = 16
     XATTN_THRESHOLD = 0.9
     XATTN_BLOCK_SIZE = 128
 

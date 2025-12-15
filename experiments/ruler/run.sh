@@ -2,10 +2,16 @@
 # Copyright (c) 2024 Microsoft
 # Licensed under The MIT License [see LICENSE for details]
 
-export TOKENIZERS_PARALLELISM=false
-RULER_PATH=$(dirname $0)
-python -c "import nltk; nltk.download('punkt')"
+# =============================================================================
+# Input Arguments
+# =============================================================================
+MODEL_NAME=/home/zijie/models/Llama-3.1-8B-Instruct # Model name or path (e.g., "meta-llama/Llama-2-7b-hf")
+MODEL_FRAMEWORK=hf                                  # Framework type: hf, minference, vllm, etc.
+ROOT_DIR=results/rulers                             # Output directory for results
 
+# =============================================================================
+# Configurable Parameters
+# =============================================================================
 SEQ_LENGTHS=(
     4096
     # 8192
@@ -37,18 +43,28 @@ TEMPERATURE="0.0"
 TOP_P="1.0"
 TOP_K="32"
 
-# The model
-MODEL_NAME=$1
+# Model Settings
 BENCHMARK="synthetic"
 MODEL_TEMPLATE_TYPE="base"
-MODEL_FRAMEWORK=$2
+GPUS="1"                    # GPU size for tensor_parallel
 
-# MInference
+# MInference Settings
 STARTING_LAYER=-1
 KV_CACHE_CPU="false"
 USE_SNAPKV="false"
 TRUST_REMOTE_CODE="true"
+# CONFIG_PATH=""            # Uncomment and set if using custom config
 
+# =============================================================================
+# Environment Setup
+# =============================================================================
+export TOKENIZERS_PARALLELISM=false
+RULER_PATH=$(dirname $0)
+python -c "import nltk; nltk.download('punkt')"
+
+# =============================================================================
+# Build Parameters
+# =============================================================================
 if [ "${MODEL_FRAMEWORK}" == "minference" ]; then
     MINFERENCE_PARAMS="--starting_layer ${STARTING_LAYER}"
 
@@ -71,10 +87,9 @@ if [ "${KV_CACHE_CPU}" == "true" ]; then
     EXTRA_PARAMS="${EXTRA_PARAMS} --kv_cache_cpu --kv_cache_cpu_device cpu"
 fi
 
-# Gpu and output path
-GPUS="1" # GPU size for tensor_parallel.
-ROOT_DIR=$3 # the path that stores generated task samples and model predictions.
-
+# =============================================================================
+# Main Execution
+# =============================================================================
 for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
 
     RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}_${MODEL_FRAMEWORK}/${BENCHMARK}/${MAX_SEQ_LENGTH}"
