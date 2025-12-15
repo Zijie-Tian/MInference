@@ -188,7 +188,9 @@ void vertical_slash_attention_cpu(
     const int head_stride = seq_len * head_dim;
     const int batch_stride = num_heads * head_stride;
 
-    #pragma omp parallel for collapse(2)
+    // NOTE: No outer-level parallelism here to avoid nested parallelism overhead
+    // Inner kernels (estimate_pattern_cpu and sparse_attention_single_head)
+    // already parallelize over seq_len, which has much higher parallelism
     for (int b = 0; b < batch_size; b++) {
         for (int h = 0; h < num_heads; h++) {
             const float* q_ptr = Q + b * batch_stride + h * head_stride;
