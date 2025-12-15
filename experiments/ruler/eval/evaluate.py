@@ -29,10 +29,10 @@ from pathlib import Path
 
 import pandas as pd
 import yaml
-from nemo.collections.asr.parts.utils.manifest_utils import (
-    read_manifest,
-    write_manifest,
-)
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../data"))
+from manifest_utils import read_manifest, write_manifest
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser()

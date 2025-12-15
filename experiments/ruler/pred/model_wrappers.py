@@ -17,10 +17,18 @@ class HuggingFaceModel:
             name_or_path, trust_remote_code=True
         )
 
+        # Try different attention implementations
+        attn_impl = "sdpa"  # Use PyTorch native SDPA as default
+        try:
+            from flash_attn import flash_attn_func
+            attn_impl = "flash_attention_2"
+        except ImportError:
+            pass
+
         if "Yarn-Llama" in name_or_path:
             model_kwargs = None
         else:
-            model_kwargs = {"attn_implementation": "flash_attention_2"}
+            model_kwargs = {"attn_implementation": attn_impl}
 
         try:
             self.pipeline = pipeline(
@@ -39,7 +47,7 @@ class HuggingFaceModel:
                 trust_remote_code=True,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
-                _attn_implementation="flash_attention_2",
+                attn_implementation=attn_impl,
             )
 
         self.generation_kwargs = generation_kwargs

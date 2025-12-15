@@ -7,7 +7,7 @@
 # =============================================================================
 MODEL_NAME=/home/zijie/models/Llama-3.1-8B-Instruct # Model name or path (e.g., "meta-llama/Llama-2-7b-hf")
 MODEL_FRAMEWORK=hf                                  # Framework type: hf, minference, vllm, etc.
-ROOT_DIR=results/rulers                             # Output directory for results
+ROOT_DIR=/home/zijie/Code/MInference/results/ruler  # Output directory for results
 
 # =============================================================================
 # Configurable Parameters
@@ -38,7 +38,7 @@ TASKS=(
 )
 
 # Experiment Setup
-NUM_SAMPLES=25
+NUM_SAMPLES=5
 TEMPERATURE="0.0"
 TOP_P="1.0"
 TOP_K="32"
@@ -60,7 +60,7 @@ TRUST_REMOTE_CODE="true"
 # =============================================================================
 export TOKENIZERS_PARALLELISM=false
 RULER_PATH=$(dirname $0)
-python -c "import nltk; nltk.download('punkt')"
+python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 
 # =============================================================================
 # Build Parameters
@@ -90,9 +90,12 @@ fi
 # =============================================================================
 # Main Execution
 # =============================================================================
+# Extract model basename for output directory naming
+MODEL_BASENAME=$(basename ${MODEL_NAME})
+
 for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
 
-    RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}_${MODEL_FRAMEWORK}/${BENCHMARK}/${MAX_SEQ_LENGTH}"
+    RESULTS_DIR="${ROOT_DIR}/${MODEL_BASENAME}_${MODEL_FRAMEWORK}/${BENCHMARK}/${MAX_SEQ_LENGTH}"
     DATA_DIR="${RESULTS_DIR}/data"
     PRED_DIR="${RESULTS_DIR}/pred"
     mkdir -p ${DATA_DIR}

@@ -25,10 +25,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from nemo.collections.asr.parts.utils.manifest_utils import (
-    read_manifest,
-    write_manifest,
-)
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from manifest_utils import read_manifest, write_manifest
 from tqdm import tqdm
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
